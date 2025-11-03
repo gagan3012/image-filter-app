@@ -9,7 +9,16 @@ st.title("Image Triplet Filter")
 # ---------- Google Drive helpers ----------
 @st.cache_resource
 def get_drive():
-    sa_info = json.loads(st.secrets["gcp"]["service_account"])
+    # Be tolerant to secrets pasted with """ ... """ (which turns \n into real newlines)
+    sa_raw = st.secrets["gcp"]["service_account"]
+    if isinstance(sa_raw, str):
+        # if there are real newlines inside the private key, re-escape them
+        if "private_key" in sa_raw and "\n" in sa_raw and "\\n" not in sa_raw:
+            sa_raw = sa_raw.replace("\r\n", "\\n").replace("\n", "\\n")
+        sa_info = json.loads(sa_raw)
+    else:
+        sa_info = dict(sa_raw)
+
     creds = service_account.Credentials.from_service_account_info(
         sa_info, scopes=["https://www.googleapis.com/auth/drive"]
     )
@@ -21,7 +30,7 @@ def drive_download_bytes(drive, file_id: str) -> bytes:
     downloader = MediaIoBaseDownload(buf, req)
     done = False
     while not done:
-        status, done = downloader.next_chunk()
+        _, done = downloader.next_chunk()
     buf.seek(0)
     return buf.read()
 
@@ -40,7 +49,8 @@ def find_file_id_in_folder(drive, folder_id: str, filename: str) -> str | None:
 
 def ensure_empty_txt_in_folder(drive, parent_id: str, name: str) -> str:
     fid = find_file_id_in_folder(drive, parent_id, name)
-    if fid: return fid
+    if fid:
+        return fid
     return drive_upload_bytes(drive, parent_id, name, b"", "text/plain")["id"]
 
 def copy_file_to_folder(drive, src_file_id: str, new_name: str, dest_folder_id: str) -> str:
@@ -50,7 +60,7 @@ def copy_file_to_folder(drive, src_file_id: str, new_name: str, dest_folder_id: 
 def read_jsonl_from_drive(drive, file_id: str, max_lines: int | None = None):
     raw = drive_download_bytes(drive, file_id).decode("utf-8", errors="ignore")
     out = []
-    for i, line in enumerate(raw.splitlines()):
+    for line in raw.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -81,6 +91,7 @@ CATEGORY_CFG = {
         "hypo_prefix": "dem_h",
         "adv_prefix":  "dem_ah",
         "log_name": "demography_filtered.jsonl",
+        "log_id_secret": "demography_filtered_log_id",
     },
     "animal": {
         "jsonl_id": st.secrets["gcp"]["animal_jsonl_id"],
@@ -91,6 +102,7 @@ CATEGORY_CFG = {
         "hypo_prefix": "ani_h",
         "adv_prefix":  "ani_ah",
         "log_name": "animal_filtered.jsonl",
+        "log_id_secret": "animal_filtered_log_id",
     },
     "objects": {
         "jsonl_id": st.secrets["gcp"]["objects_jsonl_id"],
@@ -101,6 +113,7 @@ CATEGORY_CFG = {
         "hypo_prefix": "obj_h",
         "adv_prefix":  "obj_ah",
         "log_name": "objects_filtered.jsonl",
+        "log_id_secret": "objects_filtered_log_id",
     },
 }
 
@@ -111,40 +124,20 @@ cat = st.sidebar.selectbox("Category", list(CATEGORY_CFG.keys()))
 limit = st.sidebar.number_input("Load first N records", 50, 10000, 500, 50)
 
 cfg = CATEGORY_CFG[cat]
-logs_parent = st.secrets["gcp"]["filtered_logs_parent"]
-log_file_id = ensure_empty_txt_in_folder(drive, logs_parent, cfg["log_name"])
 
-@st.cache_data(show_spinner=True)
-def load_meta(jsonl_id, n):
-    return read_jsonl_from_drive(drive, jsonl_id, max_lines=n)
+# Prefer per-category log file id if provided; else fall back to parent folder creation.
+log_file_id = None
+try:
+    per_cat_log_id = st.secrets["gcp"][cfg["log_id_secret"]]
+    if per_cat_log_id:
+        log_file_id = per_cat_log_id
+except Exception:
+    pass
 
-@st.cache_data(show_spinner=False)
-def load_decisions_map(file_id):
-    txt = read_text_from_drive(drive, file_id)
-    decided = {}
-    for line in txt.splitlines():
-        if not line.strip(): continue
-        try:
-            rec = json.loads(line)
-            decided[rec["id"]] = rec
-        except Exception:
-            continue
-    return decided
-
-meta = load_meta(cfg["jsonl_id"], limit)
-decided_map = load_decisions_map(log_file_id)
-
-# position/resume
-if "idx" not in st.session_state:
-    st.session_state.idx = 0
-
-def jump_to_next_undecided(start_idx):
-    for j in range(start_idx, len(meta)):
-        if meta[j]["id"] not in decided_map:
-            return j
-    return len(meta) - 1
-
-st.session_state.idx = jump_to_next_undecided(st.session_state.idx)
+if not log_file_id:
+    # will raise KeyError if not set, which is fine (explicit)
+    logs_parent = st.secrets["gcp"]["filtered_logs_parent"]
+    log_file_id = ensure_empty_txt_in_folder(drive, logs_parent, cfg["log_name"])
 
 # ---------- Navigation ----------
 c1, c2, c3 = st.columns([1,1,4])
