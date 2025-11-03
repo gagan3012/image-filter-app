@@ -1,18 +1,17 @@
 import io, json, streamlit as st
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-st.set_page_config(page_title="Image Triplet Viewer", layout="wide")
-st.title("Image Triplet Viewer (Demography / Animals / Objects)")
+st.set_page_config(page_title="Image Triplet Filter", layout="wide")
+st.title("Image Triplet Filter")
 
 # ---------- Google Drive helpers ----------
 @st.cache_resource
 def get_drive():
     sa_info = json.loads(st.secrets["gcp"]["service_account"])
     creds = service_account.Credentials.from_service_account_info(
-        sa_info,
-        scopes=["https://www.googleapis.com/auth/drive.readonly"]
+        sa_info, scopes=["https://www.googleapis.com/auth/drive"]
     )
     return build("drive", "v3", credentials=creds)
 
@@ -26,12 +25,27 @@ def drive_download_bytes(drive, file_id: str) -> bytes:
     buf.seek(0)
     return buf.read()
 
+def drive_upload_bytes(drive, parent_id: str, name: str, data: bytes, mime="text/plain", file_id: str | None=None):
+    media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
+    if file_id:
+        return drive.files().update(fileId=file_id, media_body=media).execute()
+    body = {"name": name, "parents": [parent_id], "mimeType": mime}
+    return drive.files().create(body=body, media_body=media, fields="id,name").execute()
+
 def find_file_id_in_folder(drive, folder_id: str, filename: str) -> str | None:
-    # search by exact name inside parent folder
     q = f"'{folder_id}' in parents and name = '{filename}' and trashed = false"
     resp = drive.files().list(q=q, spaces="drive", fields="files(id,name)", pageSize=1).execute()
     files = resp.get("files", [])
     return files[0]["id"] if files else None
+
+def ensure_empty_txt_in_folder(drive, parent_id: str, name: str) -> str:
+    fid = find_file_id_in_folder(drive, parent_id, name)
+    if fid: return fid
+    return drive_upload_bytes(drive, parent_id, name, b"", "text/plain")["id"]
+
+def copy_file_to_folder(drive, src_file_id: str, new_name: str, dest_folder_id: str) -> str:
+    body = {"name": new_name, "parents": [dest_folder_id]}
+    return drive.files().copy(fileId=src_file_id, body=body, fields="id,name").execute()["id"]
 
 def read_jsonl_from_drive(drive, file_id: str, max_lines: int | None = None):
     raw = drive_download_bytes(drive, file_id).decode("utf-8", errors="ignore")
@@ -48,95 +62,171 @@ def read_jsonl_from_drive(drive, file_id: str, max_lines: int | None = None):
             break
     return out
 
+def read_text_from_drive(drive, file_id: str) -> str:
+    return drive_download_bytes(drive, file_id).decode("utf-8", errors="ignore")
+
+def append_lines_to_drive_text(drive, file_id: str, new_lines: list[str]):
+    prev = read_text_from_drive(drive, file_id)
+    updated = prev + "".join(new_lines)
+    drive_upload_bytes(drive, parent_id="", name="", data=updated.encode("utf-8"), file_id=file_id)
+
 # ---------- Config per category ----------
 CATEGORY_CFG = {
     "demography": {
         "jsonl_id": st.secrets["gcp"]["demography_jsonl_id"],
-        "hypo_folder": st.secrets["gcp"]["demography_hypo_folder"],
-        "adv_folder":  st.secrets["gcp"]["demography_adv_folder"],
+        "src_hypo": st.secrets["gcp"]["demography_hypo_folder"],
+        "src_adv":  st.secrets["gcp"]["demography_adv_folder"],
+        "dst_hypo": st.secrets["gcp"]["demography_hypo_filtered"],
+        "dst_adv":  st.secrets["gcp"]["demography_adv_filtered"],
         "hypo_prefix": "dem_h",
         "adv_prefix":  "dem_ah",
+        "log_name": "demography_filtered.jsonl",
     },
     "animal": {
         "jsonl_id": st.secrets["gcp"]["animal_jsonl_id"],
-        "hypo_folder": st.secrets["gcp"]["animal_hypo_folder"],
-        "adv_folder":  st.secrets["gcp"]["animal_adv_folder"],
+        "src_hypo": st.secrets["gcp"]["animal_hypo_folder"],
+        "src_adv":  st.secrets["gcp"]["animal_adv_folder"],
+        "dst_hypo": st.secrets["gcp"]["animal_hypo_filtered"],
+        "dst_adv":  st.secrets["gcp"]["animal_adv_filtered"],
         "hypo_prefix": "ani_h",
         "adv_prefix":  "ani_ah",
+        "log_name": "animal_filtered.jsonl",
     },
     "objects": {
         "jsonl_id": st.secrets["gcp"]["objects_jsonl_id"],
-        "hypo_folder": st.secrets["gcp"]["objects_hypo_folder"],
-        "adv_folder":  st.secrets["gcp"]["objects_adv_folder"],
+        "src_hypo": st.secrets["gcp"]["objects_hypo_folder"],
+        "src_adv":  st.secrets["gcp"]["objects_adv_folder"],
+        "dst_hypo": st.secrets["gcp"]["objects_hypo_filtered"],
+        "dst_adv":  st.secrets["gcp"]["objects_adv_filtered"],
         "hypo_prefix": "obj_h",
         "adv_prefix":  "obj_ah",
+        "log_name": "objects_filtered.jsonl",
     },
 }
 
-# ---------- UI: pick category & browse ----------
 drive = get_drive()
 
-left = st.sidebar
-category = left.selectbox("Category", list(CATEGORY_CFG.keys()), index=0)
-limit = left.number_input("Load first N records", min_value=50, max_value=5000, value=300, step=50)
+# ---------- Sidebar ----------
+cat = st.sidebar.selectbox("Category", list(CATEGORY_CFG.keys()))
+limit = st.sidebar.number_input("Load first N records", 50, 10000, 500, 50)
 
-cfg = CATEGORY_CFG[category]
-st.caption(f"Loading **{category}**: JSONL {cfg['jsonl_id']}")
+cfg = CATEGORY_CFG[cat]
+logs_parent = st.secrets["gcp"]["filtered_logs_parent"]
+log_file_id = ensure_empty_txt_in_folder(drive, logs_parent, cfg["log_name"])
 
 @st.cache_data(show_spinner=True)
 def load_meta(jsonl_id, n):
     return read_jsonl_from_drive(drive, jsonl_id, max_lines=n)
 
-meta = load_meta(cfg["jsonl_id"], limit)
+@st.cache_data(show_spinner=False)
+def load_decisions_map(file_id):
+    txt = read_text_from_drive(drive, file_id)
+    decided = {}
+    for line in txt.splitlines():
+        if not line.strip(): continue
+        try:
+            rec = json.loads(line)
+            decided[rec["id"]] = rec
+        except Exception:
+            continue
+    return decided
 
+meta = load_meta(cfg["jsonl_id"], limit)
+decided_map = load_decisions_map(log_file_id)
+
+# position/resume
 if "idx" not in st.session_state:
     st.session_state.idx = 0
 
-colA, colB, colC = st.columns([1,1,2])
-with colA:
-    if st.button("⏮ Prev", use_container_width=True):
-        st.session_state.idx = max(0, st.session_state.idx - 1)
-with colB:
-    if st.button("Next ⏭", use_container_width=True):
-        st.session_state.idx = min(len(meta) - 1, st.session_state.idx + 1)
-with colC:
-    st.write(f"Record {st.session_state.idx+1} / {len(meta)}")
+def jump_to_next_undecided(start_idx):
+    for j in range(start_idx, len(meta)):
+        if meta[j]["id"] not in decided_map:
+            return j
+    return len(meta) - 1
+
+st.session_state.idx = jump_to_next_undecided(st.session_state.idx)
+
+# ---------- Navigation ----------
+c1, c2, c3 = st.columns([1,1,4])
+with c1:
+    if st.button("⏮ Prev undecided", use_container_width=True):
+        # find previous undecided
+        j = st.session_state.idx - 1
+        while j >= 0 and meta[j]["id"] in decided_map:
+            j -= 1
+        if j >= 0: st.session_state.idx = j
+with c2:
+    if st.button("Next undecided ⏭", use_container_width=True):
+        st.session_state.idx = jump_to_next_undecided(st.session_state.idx + 1)
+with c3:
+    st.write(f"Record {st.session_state.idx+1} / {len(meta)} (undecided left: {sum(1 for m in meta if m['id'] not in decided_map)})")
 
 if not meta:
-    st.warning("No records loaded. Check Drive IDs/sharing.")
+    st.warning("No records loaded.")
     st.stop()
 
 entry = meta[st.session_state.idx]
 st.subheader(entry.get("id","(no id)"))
 
-# Texts
+# ---------- Texts ----------
 with st.expander("📝 Text fields", expanded=True):
     st.markdown(f"**TEXT**: {entry.get('text','')}")
     st.markdown(f"**HYPOTHESIS (non-prototype)**: {entry.get('hypothesis','')}")
     st.markdown(f"**ADVERSARIAL (prototype)**: {entry.get('adversarial','')}")
 
-# Resolve filenames → Drive file IDs
+# ---------- Resolve source images in Drive ----------
 hypo_name = entry.get("hypo_id")
 adv_name  = entry.get("adversarial_id")
 
-h_id = find_file_id_in_folder(drive, cfg["hypo_folder"], hypo_name) if hypo_name else None
-a_id = find_file_id_in_folder(drive, cfg["adv_folder"],  adv_name)  if adv_name  else None
+src_h_id = find_file_id_in_folder(drive, cfg["src_hypo"], hypo_name) if hypo_name else None
+src_a_id = find_file_id_in_folder(drive, cfg["src_adv"],  adv_name)  if adv_name  else None
 
 col1, col2 = st.columns(2)
 with col1:
     st.markdown("**Hypothesis (non-proto)**")
-    if h_id:
-        img_bytes = drive_download_bytes(drive, h_id)
-        st.image(img_bytes, caption=hypo_name, use_column_width=True)
+    if src_h_id:
+        st.image(drive_download_bytes(drive, src_h_id), caption=hypo_name, use_column_width=True)
     else:
-        st.error(f"Not found in Drive: {hypo_name}")
+        st.error(f"Missing: {hypo_name}")
 with col2:
     st.markdown("**Adversarial (proto)**")
-    if a_id:
-        img_bytes = drive_download_bytes(drive, a_id)
-        st.image(img_bytes, caption=adv_name, use_column_width=True)
+    if src_a_id:
+        st.image(drive_download_bytes(drive, src_a_id), caption=adv_name, use_column_width=True)
     else:
-        st.error(f"Not found in Drive: {adv_name}")
+        st.error(f"Missing: {adv_name}")
+
+# ---------- Select / Reject ----------
+sel_col, rej_col, skip_col = st.columns([1,1,2])
+
+def write_decision(status: str, copied_h=None, copied_a=None):
+    # make a single JSON line with full metadata + status + (optional) copied ids
+    rec = dict(entry)
+    rec.update({
+        "status": status,
+        "hypo_copied_id": copied_h,
+        "adv_copied_id":  copied_a
+    })
+    append_lines_to_drive_text(drive, log_file_id, [json.dumps(rec, ensure_ascii=False) + "\n"])
+    # clear caches for decisions and advance
+    load_decisions_map.clear()
+    st.session_state.idx = jump_to_next_undecided(st.session_state.idx + 1)
+    st.experimental_rerun()
+
+with sel_col:
+    if st.button("✅ SELECT (copy & log)", type="primary", use_container_width=True, disabled=not (src_h_id and src_a_id)):
+        # copy both images to filtered folders
+        new_h_id = copy_file_to_folder(drive, src_h_id, hypo_name, cfg["dst_hypo"]) if src_h_id else None
+        new_a_id = copy_file_to_folder(drive, src_a_id,  adv_name, cfg["dst_adv"])  if src_a_id else None
+        write_decision("selected", new_h_id, new_a_id)
+
+with rej_col:
+    if st.button("❌ REJECT (log only)", use_container_width=True):
+        write_decision("rejected")
+
+with skip_col:
+    if st.button("↪️ Skip", use_container_width=True):
+        st.session_state.idx = jump_to_next_undecided(st.session_state.idx + 1)
+        st.experimental_rerun()
 
 # =============================================================================================================================
 # import io, json, time
