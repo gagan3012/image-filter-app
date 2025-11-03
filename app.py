@@ -1,16 +1,144 @@
-# app.py (smoke test)
-import streamlit as st
+import io, json, streamlit as st
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
-st.set_page_config(page_title="Smoke Test", layout="wide")
-st.markdown("## ✅ Streamlit is rendering")
+st.set_page_config(page_title="Image Triplet Viewer", layout="wide")
+st.title("Image Triplet Viewer (Demography / Animals / Objects)")
 
-# show environment quickly
-import sys, pkgutil
-st.write("Python:", sys.version)
-st.write("Installed pkgs:", len(list(pkgutil.iter_modules())))
+# ---------- Google Drive helpers ----------
+@st.cache_resource
+def get_drive():
+    sa_info = json.loads(st.secrets["gcp"]["service_account"])
+    creds = service_account.Credentials.from_service_account_info(
+        sa_info,
+        scopes=["https://www.googleapis.com/auth/drive.readonly"]
+    )
+    return build("drive", "v3", credentials=creds)
 
-# no Drive calls, no secrets, no heavy imports
-st.success("If you see this, the blank page wasn't Streamlit Cloud itself.")
+def drive_download_bytes(drive, file_id: str) -> bytes:
+    req = drive.files().get_media(fileId=file_id)
+    buf = io.BytesIO()
+    downloader = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+    buf.seek(0)
+    return buf.read()
+
+def find_file_id_in_folder(drive, folder_id: str, filename: str) -> str | None:
+    # search by exact name inside parent folder
+    q = f"'{folder_id}' in parents and name = '{filename}' and trashed = false"
+    resp = drive.files().list(q=q, spaces="drive", fields="files(id,name)", pageSize=1).execute()
+    files = resp.get("files", [])
+    return files[0]["id"] if files else None
+
+def read_jsonl_from_drive(drive, file_id: str, max_lines: int | None = None):
+    raw = drive_download_bytes(drive, file_id).decode("utf-8", errors="ignore")
+    out = []
+    for i, line in enumerate(raw.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            continue
+        if max_lines and len(out) >= max_lines:
+            break
+    return out
+
+# ---------- Config per category ----------
+CATEGORY_CFG = {
+    "demography": {
+        "jsonl_id": st.secrets["gcp"]["demography_jsonl_id"],
+        "hypo_folder": st.secrets["gcp"]["demography_hypo_folder"],
+        "adv_folder":  st.secrets["gcp"]["demography_adv_folder"],
+        "hypo_prefix": "dem_h",
+        "adv_prefix":  "dem_ah",
+    },
+    "animal": {
+        "jsonl_id": st.secrets["gcp"]["animal_jsonl_id"],
+        "hypo_folder": st.secrets["gcp"]["animal_hypo_folder"],
+        "adv_folder":  st.secrets["gcp"]["animal_adv_folder"],
+        "hypo_prefix": "ani_h",
+        "adv_prefix":  "ani_ah",
+    },
+    "objects": {
+        "jsonl_id": st.secrets["gcp"]["objects_jsonl_id"],
+        "hypo_folder": st.secrets["gcp"]["objects_hypo_folder"],
+        "adv_folder":  st.secrets["gcp"]["objects_adv_folder"],
+        "hypo_prefix": "obj_h",
+        "adv_prefix":  "obj_ah",
+    },
+}
+
+# ---------- UI: pick category & browse ----------
+drive = get_drive()
+
+left = st.sidebar
+category = left.selectbox("Category", list(CATEGORY_CFG.keys()), index=0)
+limit = left.number_input("Load first N records", min_value=50, max_value=5000, value=300, step=50)
+
+cfg = CATEGORY_CFG[category]
+st.caption(f"Loading **{category}**: JSONL {cfg['jsonl_id']}")
+
+@st.cache_data(show_spinner=True)
+def load_meta(jsonl_id, n):
+    return read_jsonl_from_drive(drive, jsonl_id, max_lines=n)
+
+meta = load_meta(cfg["jsonl_id"], limit)
+
+if "idx" not in st.session_state:
+    st.session_state.idx = 0
+
+colA, colB, colC = st.columns([1,1,2])
+with colA:
+    if st.button("⏮ Prev", use_container_width=True):
+        st.session_state.idx = max(0, st.session_state.idx - 1)
+with colB:
+    if st.button("Next ⏭", use_container_width=True):
+        st.session_state.idx = min(len(meta) - 1, st.session_state.idx + 1)
+with colC:
+    st.write(f"Record {st.session_state.idx+1} / {len(meta)}")
+
+if not meta:
+    st.warning("No records loaded. Check Drive IDs/sharing.")
+    st.stop()
+
+entry = meta[st.session_state.idx]
+st.subheader(entry.get("id","(no id)"))
+
+# Texts
+with st.expander("📝 Text fields", expanded=True):
+    st.markdown(f"**TEXT**: {entry.get('text','')}")
+    st.markdown(f"**HYPOTHESIS (non-prototype)**: {entry.get('hypothesis','')}")
+    st.markdown(f"**ADVERSARIAL (prototype)**: {entry.get('adversarial','')}")
+
+# Resolve filenames → Drive file IDs
+hypo_name = entry.get("hypo_id")
+adv_name  = entry.get("adversarial_id")
+
+h_id = find_file_id_in_folder(drive, cfg["hypo_folder"], hypo_name) if hypo_name else None
+a_id = find_file_id_in_folder(drive, cfg["adv_folder"],  adv_name)  if adv_name  else None
+
+col1, col2 = st.columns(2)
+with col1:
+    st.markdown("**Hypothesis (non-proto)**")
+    if h_id:
+        img_bytes = drive_download_bytes(drive, h_id)
+        st.image(img_bytes, caption=hypo_name, use_column_width=True)
+    else:
+        st.error(f"Not found in Drive: {hypo_name}")
+with col2:
+    st.markdown("**Adversarial (proto)**")
+    if a_id:
+        img_bytes = drive_download_bytes(drive, a_id)
+        st.image(img_bytes, caption=adv_name, use_column_width=True)
+    else:
+        st.error(f"Not found in Drive: {adv_name}")
+
+# =============================================================================================================================
 # import io, json, time
 # from typing import Dict, List, Optional
 # import streamlit as st
