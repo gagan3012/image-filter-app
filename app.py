@@ -48,15 +48,30 @@ def drive_upload_bytes(drive, parent_id: str, name: str, data: bytes,
                        mime="text/plain", file_id: str | None = None):
     media = MediaIoBaseUpload(io.BytesIO(data), mimetype=mime, resumable=False)
     if file_id:
-        return drive.files().update(fileId=file_id, media_body=media).execute()
+        # update existing (supports all drives)
+        return drive.files().update(
+            fileId=file_id, media_body=media, supportsAllDrives=True
+        ).execute()
     meta = {"name": name, "parents": [parent_id], "mimeType": mime}
-    return drive.files().create(body=meta, media_body=media, fields="id,name").execute()
+    return drive.files().create(
+        body=meta, media_body=media, fields="id,name", supportsAllDrives=True
+    ).execute()
 
 def find_file_id_in_folder(drive, folder_id: str, filename: str) -> str | None:
+    # Works in My Drive and Shared Drives
     q = f"'{folder_id}' in parents and name = '{filename}' and trashed = false"
-    resp = drive.files().list(q=q, spaces="drive", fields="files(id,name)", pageSize=1).execute()
+    resp = drive.files().list(
+        q=q,
+        spaces="drive",
+        fields="files(id,name)",
+        pageSize=1,
+        corpora="allDrives",
+        includeItemsFromAllDrives=True,
+        supportsAllDrives=True,
+    ).execute()
     files = resp.get("files", [])
     return files[0]["id"] if files else None
+
 
 def ensure_empty_txt_in_folder(drive, parent_id: str, name: str) -> str:
     fid = find_file_id_in_folder(drive, parent_id, name)
@@ -64,8 +79,28 @@ def ensure_empty_txt_in_folder(drive, parent_id: str, name: str) -> str:
     return drive_upload_bytes(drive, parent_id, name, b"", "text/plain")["id"]
 
 def copy_file_to_folder(drive, src_file_id: str, new_name: str, dest_folder_id: str) -> str:
+    # Copy works in My Drive & Shared Drives when supportsAllDrives=True
     body = {"name": new_name, "parents": [dest_folder_id]}
-    return drive.files().copy(fileId=src_file_id, body=body, fields="id,name").execute()["id"]
+    try:
+        return drive.files().copy(
+            fileId=src_file_id,
+            body=body,
+            fields="id,name",
+            supportsAllDrives=True,
+        ).execute()["id"]
+    except HttpError as e:
+        # Surface a clear message in the UI so you know which ID failed
+        st.error(
+            "Drive copy failed.\n\n"
+            f"- **Source file id**: `{src_file_id}`\n"
+            f"- **Dest folder id**: `{dest_folder_id}`\n\n"
+            "Likely causes:\n"
+            "• The service account does **not** have Editor on the destination folder.\n"
+            "• The destination is a Shared Drive and `supportsAllDrives` wasn’t set (now fixed).\n"
+            "• The dest folder id is incorrect.\n\n"
+            f"Raw error: {e}"
+        )
+        raise
 
 def read_jsonl_from_drive(drive, file_id: str, max_lines: int | None = None):
     try:
