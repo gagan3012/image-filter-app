@@ -125,33 +125,65 @@ def append_lines_to_drive_text(drive, file_id: str, new_lines: list[str]):
 
 # ========== 2) Category configuration from secrets ==========
 # Expect these keys inside [gcp] in secrets.toml
-CAT_CFG = {
+CAT_CFG = CATEGORY_CFG = {
     "demography": {
-        "jsonl_id":           lambda s: s["demography_jsonl_id"],
-        "src_hypo_folder":    lambda s: s["demography_hypo_folder"],
-        "src_adv_folder":     lambda s: s["demography_adv_folder"],
-        "dst_hypo_folder":    lambda s: s["demography_hypo_filtered"],
-        "dst_adv_folder":     lambda s: s["demography_adv_filtered"],
-        "filtered_log_id":    lambda s: s.get("demography_filtered_log_id"),
-        "log_name":           "demography_filtered.jsonl",
+        "jsonl_id": st.secrets["gcp"]["demography_jsonl_id"],
+
+        # --- Source (unfiltered) image folders ---
+        "src_hypo": st.secrets["gcp"]["demography_hypo_folder"],
+        "src_adv":  st.secrets["gcp"]["demography_adv_folder"],
+
+        # --- Destination (filtered, accepted-only) folders ---
+        "dst_hypo": st.secrets["gcp"]["demography_hypo_filtered"],
+        "dst_adv":  st.secrets["gcp"]["demography_adv_filtered"],
+
+        # --- Log file IDs (Drive JSONL for filtered results) ---
+        "log_hypo": st.secrets["gcp"]["demography_hypo_filtered_log_id"],
+        "log_adv":  st.secrets["gcp"]["demography_adv_filtered_log_id"],
+
+        # --- Filename prefixes ---
+        "hypo_prefix": "dem_h",
+        "adv_prefix":  "dem_ah",
     },
+
     "animal": {
-        "jsonl_id":           lambda s: s["animal_jsonl_id"],
-        "src_hypo_folder":    lambda s: s["animal_hypo_folder"],
-        "src_adv_folder":     lambda s: s["animal_adv_folder"],
-        "dst_hypo_folder":    lambda s: s["animal_hypo_filtered"],
-        "dst_adv_folder":     lambda s: s["animal_adv_filtered"],
-        "filtered_log_id":    lambda s: s.get("animal_filtered_log_id"),
-        "log_name":           "animal_filtered.jsonl",
+        "jsonl_id": st.secrets["gcp"]["animal_jsonl_id"],
+        
+        # --- Source (unfiltered) image folders ---
+        "src_hypo": st.secrets["gcp"]["animal_hypo_folder"],
+        "src_adv":  st.secrets["gcp"]["animal_adv_folder"],
+
+        # --- Destination (filtered, accepted-only) folders ---
+        "dst_hypo": st.secrets["gcp"]["animal_hypo_filtered"],
+        "dst_adv":  st.secrets["gcp"]["animal_adv_filtered"],
+
+        # --- Log file IDs (Drive JSONL for filtered results) ---
+        "log_hypo": st.secrets["gcp"]["animal_hypo_filtered_log_id"],
+        "log_adv":  st.secrets["gcp"]["animal_adv_filtered_log_id"],
+
+        # --- Filename prefixes ---
+        "hypo_prefix": "ani_h",
+        "adv_prefix":  "ani_ah",
     },
+
     "objects": {
-        "jsonl_id":           lambda s: s["objects_jsonl_id"],
-        "src_hypo_folder":    lambda s: s["objects_hypo_folder"],
-        "src_adv_folder":     lambda s: s["objects_adv_folder"],
-        "dst_hypo_folder":    lambda s: s["objects_hypo_filtered"],
-        "dst_adv_folder":     lambda s: s["objects_adv_filtered"],
-        "filtered_log_id":    lambda s: s.get("objects_filtered_log_id"),
-        "log_name":           "objects_filtered.jsonl",
+        "jsonl_id": st.secrets["gcp"]["objects_jsonl_id"],
+
+        # --- Source (unfiltered) image folders ---
+        "src_hypo": st.secrets["gcp"]["objects_hypo_folder"],
+        "src_adv":  st.secrets["gcp"]["objects_adv_folder"],
+
+        # --- Destination (filtered, accepted-only) folders ---
+        "dst_hypo": st.secrets["gcp"]["objects_hypo_filtered"],
+        "dst_adv":  st.secrets["gcp"]["objects_adv_filtered"],
+
+        # --- Log file IDs (Drive JSONL for filtered results) ---
+        "log_hypo": st.secrets["gcp"]["objects_hypo_filtered_log_id"],
+        "log_adv":  st.secrets["gcp"]["objects_adv_filtered_log_id"],
+
+        # --- Filename prefixes ---
+        "hypo_prefix": "obj_h",
+        "adv_prefix":  "obj_ah",
     },
 }
 
@@ -340,7 +372,7 @@ elif st.session_state.page == "review":
         st.rerun()
 
     with a1:
-        ok = st.button("✅ Accept (copy & log)", type="primary", use_container_width=True,
+        ok = st.button("✅ Accept", type="primary", use_container_width=True,
                        disabled=not (src_h_id and src_a_id))
         if ok:
             new_h_id = copy_file_to_folder(drive, src_h_id, hypo_name, dst_hypo) if src_h_id else None
@@ -348,7 +380,7 @@ elif st.session_state.page == "review":
             write_decision("selected", new_h_id, new_a_id)
 
     with a2:
-        if st.button("❌ Reject (log only)", use_container_width=True):
+        if st.button("❌ Reject", use_container_width=True):
             write_decision("rejected")
 
     # Prev / Next navigation at the bottom
