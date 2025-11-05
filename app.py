@@ -1,4 +1,6 @@
 import io, json, time
+from typing import Dict, Any, Optional
+from PIL import Image
 import streamlit as st
 
 # Google Drive API
@@ -20,7 +22,6 @@ def get_drive():
         sa = json.loads(sa_raw)
     else:
         sa = dict(sa_raw)
-
     creds = service_account.Credentials.from_service_account_info(
         sa, scopes=["https://www.googleapis.com/auth/drive"]
     )
@@ -36,7 +37,9 @@ def drive_download_bytes(drive, file_id: str) -> bytes:
     buf.seek(0)
     return buf.read()
 
-def find_file_id_in_folder(drive, folder_id: str, filename: str) -> str | None:
+def find_file_id_in_folder(drive, folder_id: str, filename: str) -> Optional[str]:
+    if not filename:
+        return None
     q = f"'{folder_id}' in parents and name = '{filename}' and trashed = false"
     resp = drive.files().list(
         q=q, spaces="drive",
@@ -47,7 +50,6 @@ def find_file_id_in_folder(drive, folder_id: str, filename: str) -> str | None:
     return files[0]["id"] if files else None
 
 def create_shortcut_to_file(drive, src_file_id: str, new_name: str, dest_folder_id: str) -> str:
-    """Create a zero-quota shortcut pointing to src_file_id."""
     meta = {
         "name": new_name,
         "mimeType": "application/vnd.google-apps.shortcut",
@@ -55,13 +57,19 @@ def create_shortcut_to_file(drive, src_file_id: str, new_name: str, dest_folder_
         "shortcutDetails": {"targetId": src_file_id},
     }
     res = drive.files().create(
-        body=meta, fields="id,name",
-        supportsAllDrives=True
+        body=meta, fields="id,name", supportsAllDrives=True
     ).execute()
     return res["id"]
 
 def read_text_from_drive(drive, file_id: str) -> str:
-    return drive_download_bytes(drive, file_id).decode("utf-8", errors="ignore")
+    req = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
+    buf = io.BytesIO()
+    dl = MediaIoBaseDownload(buf, req)
+    done = False
+    while not done:
+        _, done = dl.next_chunk()
+    buf.seek(0)
+    return buf.read().decode("utf-8", errors="ignore")
 
 def append_lines_to_drive_text(drive, file_id: str, new_lines: list[str]):
     prev = read_text_from_drive(drive, file_id)
@@ -69,33 +77,23 @@ def append_lines_to_drive_text(drive, file_id: str, new_lines: list[str]):
     media = MediaIoBaseUpload(io.BytesIO(updated.encode("utf-8")), mimetype="text/plain", resumable=False)
     drive.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
 
-def read_jsonl_from_drive(drive, file_id: str, max_lines: int | None = None):
-    # Validate ID & type
+def read_jsonl_from_drive(drive, file_id: str):
+    # validate
     try:
-        meta = drive.files().get(
-            fileId=file_id, fields="id,name,mimeType,trashed",
-            supportsAllDrives=True
-        ).execute()
+        drive.files().get(fileId=file_id, fields="id", supportsAllDrives=True).execute()
     except HttpError as e:
-        st.error(f"Could not access JSONL file. Check ID & sharing.\n\n{e}")
+        st.error(f"Cannot access JSONL file: {e}")
         st.stop()
-
-    if meta.get("trashed"):
-        st.error(f"JSONL file `{meta.get('name')}` is in Trash.")
-        st.stop()
-
-    raw = drive_download_bytes(drive, file_id).decode("utf-8", errors="ignore")
+    raw = read_text_from_drive(drive, file_id)
     out = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
+    for ln in raw.splitlines():
+        ln = ln.strip()
+        if not ln:
             continue
         try:
-            out.append(json.loads(line))
+            out.append(json.loads(ln))
         except Exception:
-            continue
-        if max_lines and len(out) >= max_lines:
-            break
+            pass
     return out
 
 # =========================== Category config ===========================
@@ -105,8 +103,8 @@ CAT = {
         "jsonl_id": st.secrets["gcp"]["demography_jsonl_id"],
         "src_hypo": st.secrets["gcp"]["demography_hypo_folder"],
         "src_adv":  st.secrets["gcp"]["demography_adv_folder"],
-        "dst_hypo": st.secrets["gcp"]["demography_hypo_filtered"],   # accepted only (shortcuts)
-        "dst_adv":  st.secrets["gcp"]["demography_adv_filtered"],    # accepted only (shortcuts)
+        "dst_hypo": st.secrets["gcp"]["demography_hypo_filtered"],   # shortcuts (accepted)
+        "dst_adv":  st.secrets["gcp"]["demography_adv_filtered"],    # shortcuts (accepted)
         "log_hypo": st.secrets["gcp"]["demography_hypo_filtered_log_id"],
         "log_adv":  st.secrets["gcp"]["demography_adv_filtered_log_id"],
         "hypo_prefix": "dem_h",
@@ -138,30 +136,38 @@ CAT = {
 
 drive = get_drive()
 
+# ===================== Cached loaders (+dedupe) ======================
+
 @st.cache_data(show_spinner=False)
 def load_meta(jsonl_id: str):
-    return read_jsonl_from_drive(drive, jsonl_id, max_lines=None)
+    return read_jsonl_from_drive(drive, jsonl_id)
+
+def _latest_by_pair(lines: list[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    From JSONL rows, keep only the latest per pair_key.
+    We accept both old rows (without pair_key) and new rows (with pair_key).
+    """
+    m = {}
+    for rec in lines:
+        hypo = rec.get("hypo_id") or ""
+        adv  = rec.get("adversarial_id") or ""
+        pk   = rec.get("pair_key") or f"{hypo}|{adv}"
+        rec["pair_key"] = pk
+        m[pk] = rec  # last wins
+    return m
 
 @st.cache_data(show_spinner=False)
 def load_map(file_id: str):
-    txt = read_text_from_drive(drive, file_id)
-    m = {}
-    for ln in txt.splitlines():
-        ln = ln.strip()
-        if not ln: continue
-        try:
-            r = json.loads(ln)
-            m[r["id"]] = r
-        except Exception:
-            pass
-    return m
+    rows = read_jsonl_from_drive(drive, file_id)
+    return _latest_by_pair(rows)
 
-# =========================== Router state ===========================
+# ========================= UI State =========================
 
 if "page" not in st.session_state: st.session_state.page = "home"
-if "cat" not in st.session_state:  st.session_state.cat = None
-if "idx" not in st.session_state:  st.session_state.idx = 0
-if "dec" not in st.session_state:  st.session_state.dec = {}  # per-id temp decisions: {"hypo": "accepted|rejected|None", "adv": ...}
+if "cat"  not in st.session_state: st.session_state.cat  = None
+if "idx"  not in st.session_state: st.session_state.idx  = 0
+if "dec"  not in st.session_state: st.session_state.dec  = {}   # per-pair temp: dec[_pair_key] = {"hypo":..., "adv":...}
+if "saving" not in st.session_state: st.session_state.saving = False
 
 def go(p): st.session_state.page = p
 
@@ -174,9 +180,10 @@ if st.session_state.page == "home":
         st.session_state.cat = cat_pick
         st.session_state.idx = 0
         st.session_state.dec = {}
+        st.session_state.saving = False
         go("dashboard")
 
-# =========================== DASHBOARD ===========================
+# ========================= DASHBOARD =========================
 
 elif st.session_state.page == "dashboard":
     st.button("⬅️ Back", on_click=lambda: go("home"), key="dash_back")
@@ -186,33 +193,39 @@ elif st.session_state.page == "dashboard":
         go("home")
         st.stop()
 
-    cfg = CAT[cat]
+    cfg  = CAT[cat]
     meta = load_meta(cfg["jsonl_id"])
     log_h = load_map(cfg["log_hypo"])
     log_a = load_map(cfg["log_adv"])
 
-    total = len(meta)
-    # “completed” = both sides have at least one decision line saved
-    completed = sum(1 for m in meta if m["id"] in log_h and m["id"] in log_a)
-    pending = total - completed
+    # total pairs
+    total_pairs = len(meta)
+
+    # completed = both sides present for a pair_key
+    def pair_key(e): return f"{e.get('hypo_id','')}|{e.get('adversarial_id','')}"
+    completed = sum(1 for e in meta if (pair_key(e) in log_h and pair_key(e) in log_a))
+    pending   = total_pairs - completed
 
     st.subheader(f"Category: **{cat}**")
     c1, c2, c3 = st.columns(3)
-    c1.metric("Total", total)
-    c2.metric("Completed (pair)", completed)
+    c1.metric("Total pairs", total_pairs)
+    c2.metric("Completed", completed)
     c3.metric("Pending", pending)
 
+    # find first undecided pair
+    def first_undecided_index():
+        for i, e in enumerate(meta):
+            pk = pair_key(e)
+            if not (pk in log_h and pk in log_a):
+                return i
+        return 0
+
     if st.button("▶️ Start / Resume", type="primary", key="dash_start"):
-        # jump to first example where any side is undecided
-        def undecided(i):
-            _id = meta[i]["id"]
-            return not (_id in log_h and _id in log_a)
-        nxt = next((i for i in range(len(meta)) if undecided(i)), 0) if meta else 0
-        st.session_state.idx = nxt
-        st.session_state.dec = {}
+        st.session_state.idx = first_undecided_index()
+        st.session_state.saving = False
         go("review")
 
-# =========================== REVIEW ===========================
+# ========================== REVIEW ==========================
 
 elif st.session_state.page == "review":
     top_l, _ = st.columns([1,6])
@@ -227,133 +240,135 @@ elif st.session_state.page == "review":
 
     i = max(0, min(st.session_state.idx, len(meta)-1))
     entry = meta[i]
-    _id = entry["id"]
 
-    # load prior saved status (so you see what was done already)
-    saved_h = load_map(cfg["log_hypo"]).get(_id, {}).get("status")
-    saved_a = load_map(cfg["log_adv"]).get(_id, {}).get("status")
+    # identity for this pair
+    hypo_name = entry.get("hypo_id", "")
+    adv_name  = entry.get("adversarial_id", "")
+    pair_key  = f"{hypo_name}|{adv_name}"
 
-    # init temp decisions from saved if not set this session
-    if _id not in st.session_state.dec:
-        st.session_state.dec[_id] = {
-            "hypo": saved_h,
-            "adv":  saved_a
-        }
+    # pull saved status (latest per pair) for display
+    saved_h = load_map(cfg["log_hypo"]).get(pair_key, {}).get("status")
+    saved_a = load_map(cfg["log_adv"]).get(pair_key, {}).get("status")
 
-    st.subheader(f"{_id}")
+    # init temp session decisions from saved
+    if pair_key not in st.session_state.dec:
+        st.session_state.dec[pair_key] = {"hypo": saved_h, "adv": saved_a}
+
+    st.subheader(f"{entry.get('id','(no id)')}  —  {pair_key}")
 
     with st.expander("📝 Text / Descriptions", expanded=True):
         st.markdown(f"**TEXT**: {entry.get('text','')}")
         st.markdown(f"**HYPOTHESIS (non-prototype)**: {entry.get('hypothesis','')}")
         st.markdown(f"**ADVERSARIAL (prototype)**: {entry.get('adversarial','')}")
 
-    # Resolve names → file IDs
-    hypo_name = entry.get("hypo_id")
-    adv_name  = entry.get("adversarial_id")
+    # resolve Drive IDs
+    src_h_id = find_file_id_in_folder(drive, cfg["src_hypo"], hypo_name)
+    src_a_id = find_file_id_in_folder(drive, cfg["src_adv"],  adv_name)
 
-    src_h_id = find_file_id_in_folder(drive, cfg["src_hypo"], hypo_name) if hypo_name else None
-    src_a_id = find_file_id_in_folder(drive, cfg["src_adv"],  adv_name)  if adv_name  else None
+    # cache & shrink images for faster rendering
+    @st.cache_data(show_spinner=False)
+    def get_img_bytes(fid: str) -> Optional[bytes]:
+        if not fid: return None
+        try:
+            return drive_download_bytes(drive, fid)
+        except HttpError:
+            return None
 
-    # Side-by-side with independent Accept/Reject
+    def show_img(fid: Optional[str], caption: str):
+        if not fid:
+            st.error(f"Missing image: {caption}")
+            return
+        b = get_img_bytes(fid)
+        if not b:
+            st.error(f"Cannot load: {caption}")
+            return
+        # resize client-side for faster layout (download size unchanged)
+        try:
+            im = Image.open(io.BytesIO(b))
+            im.thumbnail((1024, 1024))  # smaller display
+            st.image(im, caption=caption, use_column_width=True)
+        except Exception:
+            st.image(b, caption=caption, use_column_width=True)
+
     c1, c2 = st.columns(2)
 
-    # ---------- Hypothesis pane ----------
+    # ---------- Hypothesis ----------
     with c1:
         st.markdown("**Hypothesis (non-proto)**")
-        if src_h_id:
-            st.image(drive_download_bytes(drive, src_h_id), caption=hypo_name, use_column_width=True)
-        else:
-            st.error(f"Missing image: {hypo_name}")
-
+        show_img(src_h_id, hypo_name)
         b1, b2 = st.columns(2)
         with b1:
-            if st.button("✅ Accept (hypo)", key=f"acc_h_{_id}", use_container_width=True):
-                st.session_state.dec[_id]["hypo"] = "accepted"
+            if st.button("✅ Accept (hypo)", key=f"acc_h_{pair_key}", use_container_width=True):
+                st.session_state.dec[pair_key]["hypo"] = "accepted"
         with b2:
-            if st.button("❌ Reject (hypo)", key=f"rej_h_{_id}", use_container_width=True):
-                st.session_state.dec[_id]["hypo"] = "rejected"
+            if st.button("❌ Reject (hypo)", key=f"rej_h_{pair_key}", use_container_width=True):
+                st.session_state.dec[pair_key]["hypo"] = "rejected"
+        st.caption(f"Current: {st.session_state.dec[pair_key]['hypo'] or '—'} | Saved: {saved_h or '—'}")
 
-        st.caption(f"Current: {st.session_state.dec[_id]['hypo'] or '—'}  |  Saved: {saved_h or '—'}")
-
-    # ---------- Adversarial pane ----------
+    # ---------- Adversarial ----------
     with c2:
         st.markdown("**Adversarial (proto)**")
-        if src_a_id:
-            st.image(drive_download_bytes(drive, src_a_id), caption=adv_name, use_column_width=True)
-        else:
-            st.error(f"Missing image: {adv_name}")
-
+        show_img(src_a_id, adv_name)
         b3, b4 = st.columns(2)
         with b3:
-            if st.button("✅ Accept (adv)", key=f"acc_a_{_id}", use_container_width=True):
-                st.session_state.dec[_id]["adv"] = "accepted"
+            if st.button("✅ Accept (adv)", key=f"acc_a_{pair_key}", use_container_width=True):
+                st.session_state.dec[pair_key]["adv"] = "accepted"
         with b4:
-            if st.button("❌ Reject (adv)", key=f"rej_a_{_id}", use_container_width=True):
-                st.session_state.dec[_id]["adv"] = "rejected"
-
-        st.caption(f"Current: {st.session_state.dec[_id]['adv'] or '—'}  |  Saved: {saved_a or '—'}")
+            if st.button("❌ Reject (adv)", key=f"rej_a_{pair_key}", use_container_width=True):
+                st.session_state.dec[pair_key]["adv"] = "rejected"
+        st.caption(f"Current: {st.session_state.dec[pair_key]['adv'] or '—'} | Saved: {saved_a or '—'}")
 
     st.divider()
 
-    # ---------- Save both decisions ----------
+    # ---------- Save (idempotent; disables after click) ----------
     def save_now():
-        dec = st.session_state.dec[_id]
+        st.session_state.saving = True
+        dec = st.session_state.dec[pair_key]
         ts  = int(time.time())
 
-        # build base record (keep full metadata for downstream)
         base = dict(entry)
+        base["pair_key"] = pair_key
 
-        # hypo record
         rec_h = dict(base)
-        rec_h.update({
-            "side": "hypothesis",
-            "status": dec["hypo"] or "rejected",   # default to rejected if None
-            "decided_at": ts,
-        })
-        # adv record
+        rec_h.update({"side": "hypothesis", "status": dec.get("hypo") or "rejected", "decided_at": ts})
         rec_a = dict(base)
-        rec_a.update({
-            "side": "adversarial",
-            "status": dec["adv"] or "rejected",
-            "decided_at": ts,
-        })
+        rec_a.update({"side": "adversarial", "status": dec.get("adv") or "rejected", "decided_at": ts})
 
-        # If accepted → create shortcut in filtered folder
         try:
-            if dec["hypo"] == "accepted" and src_h_id:
-                new_h_id = create_shortcut_to_file(drive, src_h_id, hypo_name, cfg["dst_hypo"])
-                rec_h["copied_id"] = new_h_id
-            if dec["adv"] == "accepted" and src_a_id:
-                new_a_id = create_shortcut_to_file(drive, src_a_id, adv_name, cfg["dst_adv"])
-                rec_a["copied_id"] = new_a_id
+            # Only create shortcuts when accepted
+            if dec.get("hypo") == "accepted" and src_h_id:
+                rec_h["copied_id"] = create_shortcut_to_file(drive, src_h_id, hypo_name, cfg["dst_hypo"])
+            if dec.get("adv") == "accepted" and src_a_id:
+                rec_a["copied_id"] = create_shortcut_to_file(drive, src_a_id,  adv_name, cfg["dst_adv"])
         except HttpError as e:
-            st.error(
-                f"Drive copy/shortcut failed.\n\n"
-                f"Source hypo: {src_h_id}\nSource adv: {src_a_id}\n"
-                f"Dest hypo folder: {cfg['dst_hypo']}\nDest adv folder: {cfg['dst_adv']}\n\n"
-                f"{e}"
-            )
+            st.error(f"Drive shortcut failed:\n{e}")
+            st.session_state.saving = False
             return
 
-        # Write 2 JSONL lines (one per side)
         try:
+            # append both lines in one go
             append_lines_to_drive_text(drive, cfg["log_hypo"], [json.dumps(rec_h, ensure_ascii=False) + "\n"])
             append_lines_to_drive_text(drive, cfg["log_adv"],  [json.dumps(rec_a, ensure_ascii=False) + "\n"])
-            load_map.clear()  # refresh saved status on next run
-            st.success("Saved.")
         except HttpError as e:
             st.error(f"Failed to append logs: {e}")
+            st.session_state.saving = False
             return
+
+        # update caches incrementally (no full reload needed to reflect Saved)
+        load_map.clear()  # small logs -> ok to reload on next display
+        st.success("Saved.")
+        st.session_state.saving = False
 
     nav_l, save_c, nav_r = st.columns([1,2,1])
     with nav_l:
-        if st.button("⏮ Prev", key=f"prev_{_id}", use_container_width=True):
+        if st.button("⏮ Prev", key=f"prev_{pair_key}", use_container_width=True):
             st.session_state.idx = max(0, i-1)
             st.rerun()
+
     with save_c:
-        if st.button("💾 Save", type="primary", key=f"save_{_id}", use_container_width=True):
-            save_now()
+        st.button("💾 Save", type="primary", key=f"save_{pair_key}", use_container_width=True, disabled=st.session_state.saving, on_click=save_now)
+
     with nav_r:
-        if st.button("Next ⏭", key=f"next_{_id}", use_container_width=True):
+        if st.button("Next ⏭", key=f"next_{pair_key}", use_container_width=True):
             st.session_state.idx = min(len(meta)-1, i+1)
             st.rerun()
