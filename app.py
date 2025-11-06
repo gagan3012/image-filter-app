@@ -1,4 +1,4 @@
-# app.py — single-page, log-driven, overwrite-safe, compact UI
+# app.py — single-page, log-driven, overwrite-safe, compact UI (fixed save + pending)
 import io, json, time, hashlib
 from typing import Dict, Any, Optional, List, Tuple
 import requests
@@ -16,7 +16,7 @@ Image.MAX_IMAGE_PIXELS = 80_000_000
 
 st.set_page_config(page_title="Image Triplet Filter", layout="wide")
 
-# ---------- Compact CSS: keep everything on one screen ----------
+# ---------- Compact CSS ----------
 st.markdown("""
 <style>
 .block-container {padding-top: 0.7rem; padding-bottom: 0.4rem; max-width: 1400px;}
@@ -25,7 +25,7 @@ h1, h2, h3, h4 {margin: 0.2rem 0;}
 [data-testid="stMetricValue"] {font-size: 1.25rem;}
 .small-text {font-size: 0.9rem; line-height: 1.3rem;}
 .caption {font-size: 0.82rem; color: #aaa;}
-img {max-height: 500px; object-fit: contain;} /* tweak to 460 if you still need tighter */
+img {max-height: 500px; object-fit: contain;} /* tweak to 460 if needed */
 hr {margin: 0.5rem 0;}
 </style>
 """, unsafe_allow_html=True)
@@ -47,7 +47,6 @@ def do_login_ui():
             st.session_state.user = u
             st.session_state.allowed = info["categories"]
             st.session_state.cat = info["categories"][0]
-            # force index recompute on first view
             st.session_state.idx_initialized_for = None
             st.rerun()
         else:
@@ -248,21 +247,17 @@ def load_latest_map_for_annotator(log_file_id: str, who: str) -> Dict[str, Dict]
             m[pk] = r  # last wins
     return m
 
-def build_completion_sets(cat_cfg: dict, who: str) -> Tuple[set, Dict[str, Dict], Dict[str, Dict], int]:
-    """Return (completed_set, hypo_map, adv_map, partial_count) for this annotator."""
+def build_completion_sets(cat_cfg: dict, who: str) -> Tuple[set, Dict[str, Dict], Dict[str, Dict]]:
     log_h_map = load_latest_map_for_annotator(cat_cfg["log_hypo"], who)
     log_a_map = load_latest_map_for_annotator(cat_cfg["log_adv"],  who)
     completed = set()
-    partial = 0
     keys = set(log_h_map.keys()) | set(log_a_map.keys())
     for pk in keys:
         s_h = (log_h_map.get(pk, {}).get("status") or "").strip()
         s_a = (log_a_map.get(pk, {}).get("status") or "").strip()
         if s_h and s_a:
             completed.add(pk)
-        elif s_h or s_a:
-            partial += 1
-    return completed, log_h_map, log_a_map, partial
+    return completed, log_h_map, log_a_map
 
 def pk_of(e: Dict[str, Any]) -> str:
     return f"{e.get('hypo_id','')}|{e.get('adversarial_id','')}"
@@ -273,7 +268,7 @@ def first_undecided_index_for(meta: List[Dict[str, Any]], completed_set: set) ->
             return i
     return max(0, len(meta) - 1)
 
-# (Optional) pointer file as hint only
+# Optional pointer file (hint only)
 def progress_file_id_for(cat: str, who: str) -> str:
     parent = st.secrets["gcp"].get("progress_parent_id") or st.secrets["gcp"][f"{cat}_hypo_filtered_log_id"]
     fname = f"progress_{cat}_{canonical_user(who)}.txt"
@@ -309,7 +304,6 @@ if "dec"  not in st.session_state: st.session_state.dec  = {}
 if "hq"   not in st.session_state: st.session_state.hq   = False
 if "saving" not in st.session_state: st.session_state.saving = False
 if "last_save_token" not in st.session_state: st.session_state.last_save_token = None
-# to control auto-jump on category change/first load
 if "idx_initialized_for" not in st.session_state: st.session_state.idx_initialized_for = None
 
 # ========================= MAIN (single page) =========================
@@ -318,49 +312,47 @@ left, right = st.columns([2, 1.2], gap="large")
 
 with right:
     allowed = st.session_state.get("allowed", [])
-    # Category switch (no resume button anymore)
     cat_pick = st.selectbox("Category", allowed,
                             index=allowed.index(st.session_state.cat) if st.session_state.cat in allowed else 0)
     cat_changed = (cat_pick != st.session_state.cat)
     if cat_changed:
         st.session_state.cat = cat_pick
         st.session_state.dec = {}
-        st.session_state.idx_initialized_for = None  # force recompute
+        st.session_state.idx_initialized_for = None
 
     who = st.session_state.user
     cfg  = CAT[st.session_state.cat]
     meta = load_meta(cfg["jsonl_id"])
-    completed_set, _, _, partial_count = build_completion_sets(cfg, who)
+    completed_set, _, _ = build_completion_sets(cfg, who)
 
     total_pairs = len(meta)
     completed = sum(1 for e in meta if pk_of(e) in completed_set)
+    pending = max(0, total_pairs - completed)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Total", total_pairs)
     c2.metric("Completed (you)", completed)
-    c3.metric("Partial", partial_count)
+    c3.metric("Pending", pending)
 
     st.session_state.hq = st.toggle("High quality images", value=st.session_state.hq)
 
-# ----- auto-jump to first undecided once per category (and on first load) -----
+# Auto-jump to first undecided once per category / first load
 if st.session_state.idx_initialized_for != st.session_state.cat:
     meta_for_init = load_meta(CAT[st.session_state.cat]["jsonl_id"])
-    comp_set_init, _, _, _ = build_completion_sets(CAT[st.session_state.cat], st.session_state.user)
-    # hint is kept but not required; max with hint to avoid jumping backwards
+    comp_set_init, _, _ = build_completion_sets(CAT[st.session_state.cat], st.session_state.user)
     hint_idx = load_progress_hint(st.session_state.cat, st.session_state.user)
     st.session_state.idx = max(hint_idx, first_undecided_index_for(meta_for_init, comp_set_init))
     st.session_state.idx_initialized_for = st.session_state.cat
 
-# ---------------------------------- LEFT: main work area ----------------------------------
+# ------------------------------ LEFT work area ------------------------------
 with left:
     cfg = CAT[st.session_state.cat]
     meta = load_meta(cfg["jsonl_id"])
     if not meta:
         st.warning("No records."); st.stop()
 
-    completed_set, log_h_map, log_a_map, _ = build_completion_sets(cfg, st.session_state.user)
+    completed_set, log_h_map, log_a_map = build_completion_sets(cfg, st.session_state.user)
 
-    # Guard idx
     i = max(0, min(st.session_state.idx, len(meta)-1))
     entry = meta[i]
     hypo_name = entry.get("hypo_id", "")
@@ -374,13 +366,12 @@ with left:
     saved_h_copied_id = saved_h_row.get("copied_id")
     saved_a_copied_id = saved_a_row.get("copied_id")
 
-    # init session "current" from saved (so Current never blank)
     if pk not in st.session_state.dec:
         st.session_state.dec[pk] = {"hypo": saved_h or "rejected", "adv": saved_a or "rejected"}
 
     st.markdown(f"### {entry.get('id','(no id)')} — <code>{pk}</code>", unsafe_allow_html=True)
 
-    # --- Text area (clean: one visible line + expandable details) ---
+    # Text: one visible line + two expanders
     st.markdown(f'**TEXT**: {entry.get("text","")}')
     cexp1, cexp2 = st.columns(2)
     with cexp1:
@@ -440,28 +431,45 @@ with left:
         new_h_status = (dec.get("hypo") or "rejected").strip()
         new_a_status = (dec.get("adv")  or "rejected").strip()
 
-        # HYPOTHESIS side: reconcile shortcut
-        if saved_h == "accepted" and new_h_status != "accepted":
-            delete_file_by_id(drive, saved_h_copied_id or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
-            saved_h_copied_id = None
-        if new_h_status == "accepted":
-            delete_file_by_id(drive, saved_h_copied_id or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
-            if src_h_id:
-                saved_h_copied_id = create_shortcut_to_file(drive, src_h_id, hypo_name, cfg["dst_hypo"])
+        # Use local working copies to avoid Python scoping errors
+        prev_h_copied = saved_h_copied_id
+        prev_a_copied = saved_a_copied_id
+        new_h_copied  = prev_h_copied
+        new_a_copied  = prev_a_copied
 
-        # ADVERSARIAL side
-        if saved_a == "accepted" and new_a_status != "accepted":
-            delete_file_by_id(drive, saved_a_copied_id or find_file_id_in_folder(drive, cfg["dst_adv"], adv_name))
-            saved_a_copied_id = None
-        if new_a_status == "accepted":
-            delete_file_by_id(drive, saved_a_copied_id or find_file_id_in_folder(drive, cfg["dst_adv"], adv_name))
-            if src_a_id:
-                saved_a_copied_id = create_shortcut_to_file(drive, src_a_id, adv_name, cfg["dst_adv"])
+        # HYPOTHESIS side reconciliation
+        try:
+            if saved_h == "accepted" and new_h_status != "accepted":
+                delete_file_by_id(drive, prev_h_copied or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
+                new_h_copied = None
+            if new_h_status == "accepted":
+                # replace any existing shortcut with a fresh one
+                delete_file_by_id(drive, prev_h_copied or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
+                if src_h_id:
+                    new_h_copied = create_shortcut_to_file(drive, src_h_id, hypo_name, cfg["dst_hypo"])
+        except HttpError as e:
+            st.error(f"Hypothesis shortcut update failed:\n{e}")
+            st.session_state.saving = False
+            return
+
+        # ADVERSARIAL side reconciliation
+        try:
+            if saved_a == "accepted" and new_a_status != "accepted":
+                delete_file_by_id(drive, prev_a_copied or find_file_id_in_folder(drive, cfg["dst_adv"], adv_name))
+                new_a_copied = None
+            if new_a_status == "accepted":
+                delete_file_by_id(drive, prev_a_copied or find_file_id_in_folder(drive, cfg["dst_adv"], adv_name))
+                if src_a_id:
+                    new_a_copied = create_shortcut_to_file(drive, src_a_id, adv_name, cfg["dst_adv"])
+        except HttpError as e:
+            st.error(f"Adversarial shortcut update failed:\n{e}")
+            st.session_state.saving = False
+            return
 
         rec_h = dict(base); rec_h.update({"side":"hypothesis", "status": new_h_status, "decided_at": ts})
-        if saved_h_copied_id: rec_h["copied_id"] = saved_h_copied_id
+        if new_h_copied: rec_h["copied_id"] = new_h_copied
         rec_a = dict(base); rec_a.update({"side":"adversarial", "status": new_a_status, "decided_at": ts})
-        if saved_a_copied_id: rec_a["copied_id"] = saved_a_copied_id
+        if new_a_copied: rec_a["copied_id"] = new_a_copied
 
         token = hashlib.sha1(json.dumps(
             {"pk":pk, "h":rec_h["status"], "a":rec_a["status"], "who":base["_annotator_canon"]}
@@ -479,7 +487,7 @@ with left:
             st.session_state.saving = False
             return
 
-        # Clear caches so progress updates immediately
+        # Invalidate caches so counts and Saved values refresh immediately
         load_meta.clear(); load_latest_map_for_annotator.clear(); build_completion_sets.clear()
 
         st.session_state.last_save_token = token
@@ -488,7 +496,7 @@ with left:
 
         # Jump to first undecided (log-driven) and store pointer hint
         meta_local = load_meta(cfg["jsonl_id"])
-        completed_set_local, _, _, _ = build_completion_sets(cfg, st.session_state.user)
+        completed_set_local, _, _ = build_completion_sets(cfg, st.session_state.user)
         next_idx = first_undecided_index_for(meta_local, completed_set_local)
         st.session_state.idx = next_idx
         save_progress_hint(st.session_state.cat, st.session_state.user, next_idx)
