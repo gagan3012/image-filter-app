@@ -1,4 +1,4 @@
-# app.py — compact, overwrite-safe, log-driven Image Triplet Filter
+# app.py — single-page, log-driven, overwrite-safe, compact UI
 import io, json, time, hashlib
 from typing import Dict, Any, Optional, List, Tuple
 import requests
@@ -16,16 +16,16 @@ Image.MAX_IMAGE_PIXELS = 80_000_000
 
 st.set_page_config(page_title="Image Triplet Filter", layout="wide")
 
-# ---------- Compact CSS: keep everything on a single screen ----------
+# ---------- Compact CSS: keep everything on one screen ----------
 st.markdown("""
 <style>
 .block-container {padding-top: 0.7rem; padding-bottom: 0.4rem; max-width: 1400px;}
 section.main > div {padding-top: 0.1rem;}
 h1, h2, h3, h4 {margin: 0.2rem 0;}
 [data-testid="stMetricValue"] {font-size: 1.25rem;}
-.small-text {font-size: 0.88rem; line-height: 1.25rem;}
+.small-text {font-size: 0.9rem; line-height: 1.3rem;}
 .caption {font-size: 0.82rem; color: #aaa;}
-img {max-height: 500px; object-fit: contain;}  /* adjust to 460/480 if you still need tighter */
+img {max-height: 500px; object-fit: contain;} /* tweak to 460 if you still need tighter */
 hr {margin: 0.5rem 0;}
 </style>
 """, unsafe_allow_html=True)
@@ -46,7 +46,9 @@ def do_login_ui():
         if info and info["password"] == p:
             st.session_state.user = u
             st.session_state.allowed = info["categories"]
-            st.session_state.page = "main"
+            st.session_state.cat = info["categories"][0]
+            # force index recompute on first view
+            st.session_state.idx_initialized_for = None
             st.rerun()
         else:
             st.error("Invalid credentials")
@@ -92,7 +94,6 @@ def write_text_to_drive(drive, file_id: str, text: str):
                          supportsAllDrives=True).execute()
 
 def append_lines_to_drive_text(drive, file_id: str, new_lines: List[str], retries: int = 3):
-    # optimistic append with retry (handles concurrent writers)
     for attempt in range(retries):
         try:
             prev = read_text_from_drive(drive, file_id)
@@ -101,7 +102,6 @@ def append_lines_to_drive_text(drive, file_id: str, new_lines: List[str], retrie
             return
         except HttpError:
             time.sleep(0.4 * (attempt + 1))
-    # last attempt without merge
     write_text_to_drive(drive, file_id, "".join(new_lines))
 
 def find_file_id_in_folder(drive, folder_id: str, filename: str) -> Optional[str]:
@@ -119,7 +119,7 @@ def delete_file_by_id(drive, file_id: Optional[str]):
     try:
         drive.files().delete(fileId=file_id, supportsAllDrives=True).execute()
     except HttpError:
-        pass  # ignore; might have been removed manually already
+        pass  # already gone
 
 def create_shortcut_to_file(drive, src_file_id: str, new_name: str, dest_folder_id: str) -> str:
     meta = {
@@ -303,13 +303,14 @@ def save_progress_hint(cat: str, who: str, idx: int):
         pass
 
 # ========================= UI state =========================
-if "page" not in st.session_state: st.session_state.page = "main"
-if "cat"  not in st.session_state: st.session_state.cat  = None
+if "cat"  not in st.session_state: st.session_state.cat  = st.session_state.allowed[0]
 if "idx"  not in st.session_state: st.session_state.idx  = 0
 if "dec"  not in st.session_state: st.session_state.dec  = {}
 if "hq"   not in st.session_state: st.session_state.hq   = False
 if "saving" not in st.session_state: st.session_state.saving = False
 if "last_save_token" not in st.session_state: st.session_state.last_save_token = None
+# to control auto-jump on category change/first load
+if "idx_initialized_for" not in st.session_state: st.session_state.idx_initialized_for = None
 
 # ========================= MAIN (single page) =========================
 st.caption(f"Signed in as **{st.session_state.user}**")
@@ -317,44 +318,49 @@ left, right = st.columns([2, 1.2], gap="large")
 
 with right:
     allowed = st.session_state.get("allowed", [])
+    # Category switch (no resume button anymore)
     cat_pick = st.selectbox("Category", allowed,
                             index=allowed.index(st.session_state.cat) if st.session_state.cat in allowed else 0)
-    if cat_pick != st.session_state.cat:
+    cat_changed = (cat_pick != st.session_state.cat)
+    if cat_changed:
         st.session_state.cat = cat_pick
-        st.session_state.idx = 0
         st.session_state.dec = {}
-        st.experimental_rerun()
+        st.session_state.idx_initialized_for = None  # force recompute
 
     who = st.session_state.user
-    cfg  = CAT[cat_pick]
+    cfg  = CAT[st.session_state.cat]
     meta = load_meta(cfg["jsonl_id"])
     completed_set, _, _, partial_count = build_completion_sets(cfg, who)
 
     total_pairs = len(meta)
     completed = sum(1 for e in meta if pk_of(e) in completed_set)
-    pending   = total_pairs - completed
 
     c1, c2, c3 = st.columns(3)
     c1.metric("Total", total_pairs)
     c2.metric("Completed (you)", completed)
-    c3.metric("Partial", partial_count)  # explains off-by-one like 13 vs 14
+    c3.metric("Partial", partial_count)
 
-    # Resume target = first undecided, max with pointer hint
-    hint_idx = load_progress_hint(cat_pick, who)
-    start_idx = max(hint_idx, first_undecided_index_for(meta, completed_set))
+    st.session_state.hq = st.toggle("High quality images", value=st.session_state.hq)
 
-    colA, colB = st.columns(2)
-    if colA.button("⟲ Resume", use_container_width=True):
-        st.session_state.idx = start_idx; st.experimental_rerun()
-    st.session_state.hq = colB.toggle("High quality images", value=st.session_state.hq)
+# ----- auto-jump to first undecided once per category (and on first load) -----
+if st.session_state.idx_initialized_for != st.session_state.cat:
+    meta_for_init = load_meta(CAT[st.session_state.cat]["jsonl_id"])
+    comp_set_init, _, _, _ = build_completion_sets(CAT[st.session_state.cat], st.session_state.user)
+    # hint is kept but not required; max with hint to avoid jumping backwards
+    hint_idx = load_progress_hint(st.session_state.cat, st.session_state.user)
+    st.session_state.idx = max(hint_idx, first_undecided_index_for(meta_for_init, comp_set_init))
+    st.session_state.idx_initialized_for = st.session_state.cat
 
+# ---------------------------------- LEFT: main work area ----------------------------------
 with left:
-    # --- active sample index ---
-    completed_set, log_h_map, log_a_map, _ = build_completion_sets(cfg, who)
+    cfg = CAT[st.session_state.cat]
     meta = load_meta(cfg["jsonl_id"])
     if not meta:
         st.warning("No records."); st.stop()
 
+    completed_set, log_h_map, log_a_map, _ = build_completion_sets(cfg, st.session_state.user)
+
+    # Guard idx
     i = max(0, min(st.session_state.idx, len(meta)-1))
     entry = meta[i]
     hypo_name = entry.get("hypo_id", "")
@@ -372,14 +378,17 @@ with left:
     if pk not in st.session_state.dec:
         st.session_state.dec[pk] = {"hypo": saved_h or "rejected", "adv": saved_a or "rejected"}
 
-    st.markdown(f"### {entry.get('id','(no id)')} — `{pk}`")
-    # TEXT (compact)
-    st.markdown(
-        f'<div class="small-text"><b>TEXT</b>: {entry.get("text","")}</div>'
-        f'<div class="small-text"><b>HYPOTHESIS (non-prototype)</b>: {entry.get("hypothesis","")}</div>'
-        f'<div class="small-text"><b>ADVERSARIAL (prototype)</b>: {entry.get("adversarial","")}</div>',
-        unsafe_allow_html=True
-    )
+    st.markdown(f"### {entry.get('id','(no id)')} — <code>{pk}</code>", unsafe_allow_html=True)
+
+    # --- Text area (clean: one visible line + expandable details) ---
+    st.markdown(f'**TEXT**: {entry.get("text","")}')
+    cexp1, cexp2 = st.columns(2)
+    with cexp1:
+        with st.expander("HYPOTHESIS (non-prototype) — show/hide", expanded=False):
+            st.markdown(f'<div class="small-text">{entry.get("hypothesis","")}</div>', unsafe_allow_html=True)
+    with cexp2:
+        with st.expander("ADVERSARIAL (prototype) — show/hide", expanded=False):
+            st.markdown(f'<div class="small-text">{entry.get("adversarial","")}</div>', unsafe_allow_html=True)
 
     # Resolve Drive IDs
     src_h_id = find_file_id_in_folder(drive, cfg["src_hypo"], hypo_name)
@@ -431,14 +440,11 @@ with left:
         new_h_status = (dec.get("hypo") or "rejected").strip()
         new_a_status = (dec.get("adv")  or "rejected").strip()
 
-        # ---- OVERWRITE semantics for shortcuts ----
-        # HYPOTHESIS side
+        # HYPOTHESIS side: reconcile shortcut
         if saved_h == "accepted" and new_h_status != "accepted":
-            # previously accepted -> now not accepted: delete old shortcut
             delete_file_by_id(drive, saved_h_copied_id or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
             saved_h_copied_id = None
         if new_h_status == "accepted":
-            # ensure we don't leave stale shortcuts; delete then recreate
             delete_file_by_id(drive, saved_h_copied_id or find_file_id_in_folder(drive, cfg["dst_hypo"], hypo_name))
             if src_h_id:
                 saved_h_copied_id = create_shortcut_to_file(drive, src_h_id, hypo_name, cfg["dst_hypo"])
@@ -452,13 +458,11 @@ with left:
             if src_a_id:
                 saved_a_copied_id = create_shortcut_to_file(drive, src_a_id, adv_name, cfg["dst_adv"])
 
-        # ---- Log the new (latest) rows; latest wins on read ----
         rec_h = dict(base); rec_h.update({"side":"hypothesis", "status": new_h_status, "decided_at": ts})
         if saved_h_copied_id: rec_h["copied_id"] = saved_h_copied_id
         rec_a = dict(base); rec_a.update({"side":"adversarial", "status": new_a_status, "decided_at": ts})
         if saved_a_copied_id: rec_a["copied_id"] = saved_a_copied_id
 
-        # idempotence guard (avoid double click dupes)
         token = hashlib.sha1(json.dumps(
             {"pk":pk, "h":rec_h["status"], "a":rec_a["status"], "who":base["_annotator_canon"]}
         ).encode()).hexdigest()
@@ -487,14 +491,14 @@ with left:
         completed_set_local, _, _, _ = build_completion_sets(cfg, st.session_state.user)
         next_idx = first_undecided_index_for(meta_local, completed_set_local)
         st.session_state.idx = next_idx
-        save_progress_hint(cat_pick, st.session_state.user, next_idx)
+        save_progress_hint(st.session_state.cat, st.session_state.user, next_idx)
         st.experimental_rerun()
 
     navL, navC, navR = st.columns([1, 2, 1])
     with navL:
         if st.button("⏮ Prev", use_container_width=True):
             st.session_state.idx = max(0, i-1)
-            save_progress_hint(cat_pick, st.session_state.user, st.session_state.idx)
+            save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
             st.experimental_rerun()
     with navC:
         st.button("💾 Save", type="primary", use_container_width=True,
@@ -502,5 +506,5 @@ with left:
     with navR:
         if st.button("Next ⏭", use_container_width=True):
             st.session_state.idx = min(len(meta)-1, i+1)
-            save_progress_hint(cat_pick, st.session_state.user, st.session_state.idx)
+            save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
             st.experimental_rerun()
