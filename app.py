@@ -1,4 +1,4 @@
-# app.py — single-page, robust, resume-from-logs, fast previews (parallel), overwrite-safe
+# app.py — resume & counts from filtered logs, sequential (no-skip); robust & fast
 import io, json, time, hashlib, ssl, collections, re, concurrent.futures
 from typing import Dict, Any, Optional, List, Tuple
 import requests
@@ -32,7 +32,6 @@ div[data-testid="stButton"] button[k="save_btn"],
 div[data-testid="stButton"] button:where(.primary) {
   background-color: #e11d48 !important; border-color: #e11d48 !important;
 }
-/* Make center Save button span full width of its column */
 div[data-testid="stButton"] button[k="save_btn"] { width: 100%; }
 </style>
 """, unsafe_allow_html=True)
@@ -83,7 +82,7 @@ drive = get_drive()
 def _retry_sleep(attempt: int):
     time.sleep(min(1.5 * (2 ** attempt), 6.0))
 
-# --- Soft QPS guard to prevent rate spikes across concurrent annotators ---
+# --- Soft QPS guard ---
 _last_calls = collections.deque(maxlen=10)
 def _qps_guard(max_qps: float = 4.0):
     now = time.time()
@@ -95,7 +94,7 @@ def _qps_guard(max_qps: float = 4.0):
             if qps > max_qps:
                 time.sleep(min(0.25, (qps / max_qps - 1.0) * 0.12))
 
-# small in-process cache so UI doesn’t die during brief SSL hiccups
+# in-process text cache (for hiccups)
 _inproc_text_cache: Dict[str, str] = {}
 
 def _download_bytes_with_retry(drive, file_id: str, attempts: int = 6) -> bytes:
@@ -146,12 +145,11 @@ def append_lines_to_drive_text(drive, file_id: str, new_lines: List[str], retrie
             return
         except Exception:
             _retry_sleep(attempt)
-    # final attempt without merge
     prev = _inproc_text_cache.get(file_id, "")
     updated = prev + "".join(new_lines)
     write_text_to_drive(drive, file_id, updated)
 
-# --- Folder index cache: maps filename -> fileId; 1h TTL (huge QPS win) ---
+# --- Folder index cache: filename -> fileId (1h TTL) ---
 @st.cache_data(show_spinner=False, ttl=3600, max_entries=64)
 def list_folder_index(folder_id: str) -> dict[str, str]:
     drv = get_drive()
@@ -175,7 +173,7 @@ def list_folder_index(folder_id: str) -> dict[str, str]:
 def find_file_id_in_folder(drive, folder_id: str, filename: str) -> Optional[str]:
     if not filename:
         return None
-    idx = list_folder_index(folder_id)  # cached for 1 hour
+    idx = list_folder_index(folder_id)
     return idx.get(filename)
 
 def delete_file_by_id(drive, file_id: Optional[str]):
@@ -184,7 +182,7 @@ def delete_file_by_id(drive, file_id: Optional[str]):
         _qps_guard()
         drive.files().delete(fileId=file_id, supportsAllDrives=True).execute()
     except HttpError:
-        pass  # already gone
+        pass
 
 def create_shortcut_to_file(drive, src_file_id: str, new_name: str, dest_folder_id: str) -> str:
     meta = {
@@ -199,35 +197,25 @@ def create_shortcut_to_file(drive, src_file_id: str, new_name: str, dest_folder_
     return res["id"]
 
 # ================== Fast thumbnails / previews ===================
-# pooled HTTP session for thumbnails (keep-alive)
 _session = requests.Session()
 _adapter = requests.adapters.HTTPAdapter(pool_connections=32, pool_maxsize=32, max_retries=2)
-_session.mount("https://", _adapter)
-_session.mount("http://", _adapter)
+_session.mount("https://", _adapter); _session.mount("http://", _adapter)
 
-# in-session LRU for previews (distinct from st.cache_data)
 if "_lru_previews" not in st.session_state:
-    st.session_state._lru_previews = collections.OrderedDict()  # key=(file_id,max_side) -> bytes
+    st.session_state._lru_previews = collections.OrderedDict()
 _LRU_CAP = 400
-
 def _lru_put(key, val):
     lru = st.session_state._lru_previews
-    if key in lru:
-        lru.move_to_end(key)
+    if key in lru: lru.move_to_end(key)
     lru[key] = val
-    while len(lru) > _LRU_CAP:
-        lru.popitem(last=False)
-
+    while len(lru) > _LRU_CAP: lru.popitem(last=False)
 def _lru_get(key):
     lru = st.session_state._lru_previews
     if key in lru:
-        lru.move_to_end(key)
-        return lru[key]
+        lru.move_to_end(key); return lru[key]
     return None
-
 def _upgrade_thumb_url(url: str, max_side: int) -> str:
-    if not url:
-        return url
+    if not url: return url
     url = re.sub(r"(=s)\d{2,4}\b", rf"\g<1>{max_side}", url)
     url = re.sub(r"([&?])s=\d{2,4}\b", rf"\g<1>s={max_side}", url)
     return url
@@ -239,12 +227,10 @@ def drive_thumbnail_bytes(file_id: str, max_side: int = 680) -> Optional[bytes]:
         _qps_guard()
         meta = drv.files().get(fileId=file_id, fields="thumbnailLink", supportsAllDrives=True).execute()
         url = meta.get("thumbnailLink")
-        if not url:
-            return None
+        if not url: return None
         url = _upgrade_thumb_url(url, max_side)
         r = _session.get(url, timeout=6)
-        if r.ok:
-            return r.content
+        if r.ok: return r.content
     except Exception:
         pass
     return None
@@ -252,17 +238,14 @@ def drive_thumbnail_bytes(file_id: str, max_side: int = 680) -> Optional[bytes]:
 def preview_bytes(file_id: str, max_side: int = 680) -> bytes:
     key = (file_id, max_side)
     cached = _lru_get(key)
-    if cached is not None:
-        return cached
+    if cached is not None: return cached
     tb = drive_thumbnail_bytes(file_id, max_side=max_side)
     src = tb
     if src is None:
         raw = _download_bytes_with_retry(get_drive(), file_id)
         with Image.open(io.BytesIO(raw)) as im:
-            im = im.convert("RGB")
-            im.thumbnail((max_side, max_side))
-            out = io.BytesIO()
-            im.save(out, format="JPEG", quality=85, optimize=True)
+            im = im.convert("RGB"); im.thumbnail((max_side, max_side))
+            out = io.BytesIO(); im.save(out, format="JPEG", quality=85, optimize=True)
             src = out.getvalue()
     _lru_put(key, src)
     return src
@@ -291,8 +274,7 @@ def fetch_two_previews_parallel(h_id: Optional[str], a_id: Optional[str], max_si
 
 def render_preview_bytes(img_bytes: Optional[bytes], caption: str):
     if img_bytes is None:
-        st.error(f"Missing image: {caption}")
-        return
+        st.error(f"Missing image: {caption}"); return
     try:
         st.image(img_bytes, caption=caption, use_container_width=True)
     except Exception as e:
@@ -336,6 +318,15 @@ CAT = {
 def canonical_user(name: str) -> str:
     return (name or "").strip().lower()
 
+def _jsonl_rows(text: str) -> List[Dict[str, Any]]:
+    out = []
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln: continue
+        try: out.append(json.loads(ln))
+        except Exception: pass
+    return out
+
 @st.cache_data(show_spinner=False)
 def load_meta(jsonl_id: str) -> List[Dict[str, Any]]:
     try:
@@ -345,98 +336,38 @@ def load_meta(jsonl_id: str) -> List[Dict[str, Any]]:
     except HttpError as e:
         st.error(f"Cannot access JSONL file: {e}"); st.stop()
     raw = read_text_from_drive(drive, jsonl_id)
-    out: List[Dict[str, Any]] = []
-    for ln in raw.splitlines():
-        ln = ln.strip()
-        if not ln: continue
-        try: out.append(json.loads(ln))
-        except Exception: pass
-    return out
-
-def latest_rows(jsonl_text: str) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for ln in jsonl_text.splitlines():
-        ln = ln.strip()
-        if not ln: continue
-        try: out.append(json.loads(ln))
-        except Exception: pass
-    return out
+    return _jsonl_rows(raw)
 
 @st.cache_data(show_spinner=False)
-def load_latest_map_for_annotator(log_file_id: str, who: str) -> Dict[str, Dict]:
-    rows = latest_rows(read_text_from_drive(drive, log_file_id))
-    target = canonical_user(who)
-    m: Dict[str, Dict] = {}
+def load_log_rows_for_annotator(log_file_id: str, who: str) -> List[Dict[str, Any]]:
+    rows = _jsonl_rows(read_text_from_drive(drive, log_file_id))
+    who_c = canonical_user(who)
+    out = []
     for r in rows:
-        pk = r.get("pair_key") or f"{r.get('hypo_id','')}|{r.get('adversarial_id','')}"
-        r["pair_key"] = pk
         ann = canonical_user(r.get("annotator") or r.get("_annotator_canon") or "")
-        if not ann:
-            ann = target; r["annotator"] = who
-        if ann == target:
-            m[pk] = r  # last wins
-    return m
+        if not ann: ann = who_c
+        if ann == who_c:
+            r["pair_key"] = r.get("pair_key") or f"{r.get('hypo_id','')}|{r.get('adversarial_id','')}"
+            out.append(r)
+    return out
 
-def build_completion_sets(cat_cfg: dict, who: str) -> Tuple[set, Dict[str, Dict], Dict[str, Dict]]:
-    log_h_map = load_latest_map_for_annotator(cat_cfg["log_hypo"], who)
-    log_a_map = load_latest_map_for_annotator(cat_cfg["log_adv"],  who)
-    completed = set()
-    keys = set(log_h_map.keys()) | set(log_a_map.keys())
-    for pk in keys:
-        s_h = (log_h_map.get(pk, {}).get("status") or "").strip()
-        s_a = (log_a_map.get(pk, {}).get("status") or "").strip()
-        if s_h and s_a:
-            completed.add(pk)
-    return completed, log_h_map, log_a_map
+def count_completed_pairs_seq(cfg: dict, who: str) -> int:
+    """
+    Sequential, no-skip assumption:
+    Completed count = number of UNIQUE pair_keys that appear in BOTH logs for this annotator.
+    Resume index = that count (0-based).
+    """
+    rows_h = load_log_rows_for_annotator(cfg["log_hypo"], who)
+    rows_a = load_log_rows_for_annotator(cfg["log_adv"],  who)
+    seen_h = set(r["pair_key"] for r in rows_h)
+    seen_a = set(r["pair_key"] for r in rows_a)
+    completed = seen_h & seen_a
+    return len(completed)
 
 def pk_of(e: Dict[str, Any]) -> str:
     return f"{e.get('hypo_id','')}|{e.get('adversarial_id','')}"
 
-def first_undecided_index_for(meta: List[Dict[str, Any]], completed_set: set) -> int:
-    for i, e in enumerate(meta):
-        if pk_of(e) not in completed_set:
-            return i
-    return max(0, len(meta) - 1)
-
-def compute_resume_index_from_logs(meta: List[Dict[str, Any]], cfg: dict, who: str) -> int:
-    completed_set, _, _ = build_completion_sets(cfg, who)
-    for i, e in enumerate(meta):
-        if pk_of(e) not in completed_set:
-            return i
-    return max(0, len(meta) - 1)
-
-# Optional pointer file (hint only — not used for resume logic)
-def progress_file_id_for(cat: str, who: str) -> str:
-    parent = st.secrets["gcp"].get("progress_parent_id") or st.secrets["gcp"][f"{cat}_hypo_filtered_log_id"]
-    fname = f"progress_{cat}_{canonical_user(who)}.txt"
-    q = f"'{parent}' in parents and name = '{fname}' and trashed = false"
-    _qps_guard()
-    resp = drive.files().list(q=q, fields="files(id,name)", pageSize=1,
-                              supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
-    files = resp.get("files", [])
-    if files: return files[0]["id"]
-    media = MediaIoBaseUpload(io.BytesIO(b"0"), mimetype="text/plain", resumable=False)
-    meta = {"name": fname, "parents":[parent], "mimeType":"text/plain"}
-    _qps_guard()
-    return drive.files().create(body=meta, media_body=media, fields="id",
-                                supportsAllDrives=True).execute()["id"]
-
-def load_progress_hint(cat: str, who: str) -> int:
-    try:
-        fid = progress_file_id_for(cat, who)
-        txt = read_text_from_drive(drive, fid).strip()
-        return max(0, int(txt or "0"))
-    except Exception:
-        return 0
-
-def save_progress_hint(cat: str, who: str, idx: int):
-    try:
-        fid = progress_file_id_for(cat, who)
-        write_text_to_drive(drive, fid, str(idx))
-    except Exception:
-        pass
-
-# ---- Micro buffer for logs (reduces write calls) ----
+# ---- Micro buffer for logs (kept, but we force-flush on Save) ----
 if "write_buf" not in st.session_state:
     st.session_state.write_buf = {"hypo": [], "adv": [], "last_flush": 0.0}
 
@@ -485,10 +416,10 @@ with right:
     who = st.session_state.user
     cfg  = CAT[st.session_state.cat]
     meta = load_meta(cfg["jsonl_id"])
-    completed_set, _, _ = build_completion_sets(cfg, who)
 
+    # counts come strictly from filtered logs (sequential, no-skip)
+    completed = count_completed_pairs_seq(cfg, who)
     total_pairs = len(meta)
-    completed = sum(1 for e in meta if pk_of(e) in completed_set)
     pending = max(0, total_pairs - completed)
 
     c1, c2, c3 = st.columns(3)
@@ -498,11 +429,12 @@ with right:
 
     st.session_state.hq = st.toggle("High quality images", value=st.session_state.hq)
 
-# Auto-jump to first undecided ONCE per category change / cold start — logs are the source of truth
+# Auto-jump exactly to "next index" = completed count (sequential, no-skip)
 if st.session_state.idx_initialized_for != st.session_state.cat:
     cfg_init  = CAT[st.session_state.cat]
     meta_init = load_meta(cfg_init["jsonl_id"])
-    st.session_state.idx = compute_resume_index_from_logs(meta_init, cfg_init, st.session_state.user)
+    comp = count_completed_pairs_seq(cfg_init, st.session_state.user)
+    st.session_state.idx = min(comp, max(0, len(meta_init) - 1))  # if all done, land on last
     st.session_state.idx_initialized_for = st.session_state.cat
 
 # ------------------------------ LEFT work area ------------------------------
@@ -512,23 +444,25 @@ with left:
     if not meta:
         st.warning("No records."); st.stop()
 
-    completed_set, log_h_map, log_a_map = build_completion_sets(cfg, st.session_state.user)
-
+    # current index computed from logs above; show that record
     i = max(0, min(st.session_state.idx, len(meta)-1))
     entry = meta[i]
     hypo_name = entry.get("hypo_id", "")
     adv_name  = entry.get("adversarial_id", "")
     pk        = f"{hypo_name}|{adv_name}"
 
-    saved_h_row = (log_h_map.get(pk, {}) or {})
-    saved_a_row = (log_a_map.get(pk, {}) or {})
-    saved_h = (saved_h_row.get("status") or "").strip() or None
-    saved_a = (saved_a_row.get("status") or "").strip() or None
-    saved_h_copied_id = saved_h_row.get("copied_id")
-    saved_a_copied_id = saved_a_row.get("copied_id")
+    # read last saved status for labels (not for counting)
+    rows_h = load_log_rows_for_annotator(cfg["log_hypo"], st.session_state.user)
+    rows_a = load_log_rows_for_annotator(cfg["log_adv"],  st.session_state.user)
+    last_h = next((r for r in reversed(rows_h) if r["pair_key"] == pk), None)
+    last_a = next((r for r in reversed(rows_a) if r["pair_key"] == pk), None)
+    saved_h = (last_h or {}).get("status")
+    saved_a = (last_a or {}).get("status")
+    saved_h_copied_id = (last_h or {}).get("copied_id")
+    saved_a_copied_id = (last_a or {}).get("copied_id")
 
     if pk not in st.session_state.dec:
-        st.session_state.dec[pk] = {"hypo": saved_h, "adv": saved_a}
+        st.session_state.dec[pk] = {"hypo": None, "adv": None}
 
     st.markdown(f"### {entry.get('id','(no id)')} — <code>{pk}</code>", unsafe_allow_html=True)
 
@@ -542,7 +476,7 @@ with left:
         with st.expander("ADVERSARIAL (prototype) — show/hide", expanded=False):
             st.markdown(f'<div class="small-text">{entry.get("adversarial","")}</div>', unsafe_allow_html=True)
 
-    # Resolve IDs (fast via cached index), fetch previews in parallel, render instantly
+    # Resolve IDs, fetch previews in parallel
     src_h_id = find_file_id_in_folder(drive, cfg["src_hypo"], hypo_name)
     src_a_id = find_file_id_in_folder(drive, cfg["src_adv"],  adv_name)
     prev_h_bytes, prev_a_bytes = fetch_two_previews_parallel(src_h_id, src_a_id, max_side=680)
@@ -591,10 +525,9 @@ with left:
 
     st.markdown("<hr/>", unsafe_allow_html=True)
 
-    # ---------- SAVE & NAV (overwrite-safe + cleanup) ----------
+    # ---------- SAVE & NAV (overwrite-safe + cleanup, and FORCE-FLUSH logs) ----------
     def save_now():
         st.session_state.saving = True
-
         dec = st.session_state.dec[pk]
         cur_h, cur_a = dec.get("hypo"), dec.get("adv")
         if cur_h not in {"accepted", "rejected"} or cur_a not in {"accepted", "rejected"}:
@@ -607,7 +540,6 @@ with left:
         base["pair_key"]  = pk
         base["annotator"] = st.session_state.user
         base["_annotator_canon"] = canonical_user(st.session_state.user)
-
         new_h_status, new_a_status = cur_h, cur_a
 
         prev_h_copied = saved_h_copied_id
@@ -651,42 +583,37 @@ with left:
             st.session_state.last_save_flash = {"msg": "Already saved this exact decision.", "ok": True, "ts": time.time()}
             return
 
-        # Buffered appends → fewer drive writes
         try:
             st.session_state.write_buf["hypo"].append(json.dumps(rec_h, ensure_ascii=False) + "\n")
             st.session_state.write_buf["adv"].append(json.dumps(rec_a, ensure_ascii=False) + "\n")
-            _flush_logs_if_needed(cfg, force=False)
+            _flush_logs_if_needed(cfg, force=True)   # <-- FORCE FLUSH so count updates immediately
         except Exception as e:
             st.session_state.saving = False
-            st.session_state.last_save_flash = {"msg": f"Failed to buffer logs: {e}", "ok": False, "ts": time.time()}
+            st.session_state.last_save_flash = {"msg": f"Failed to write logs: {e}", "ok": False, "ts": time.time()}
             return
 
-        # Invalidate caches for readers
-        try: load_meta.clear()
-        except: pass
-        try: load_latest_map_for_annotator.clear()
+        # No stale caches for logs readers
+        try: load_log_rows_for_annotator.clear()
         except: pass
 
         st.session_state.last_save_token = token
         st.session_state.saving = False
 
-        # Decide next index purely from logs (source of truth), then prefetch next previews
-        meta_local = load_meta(cfg["jsonl_id"])
-        next_idx = compute_resume_index_from_logs(meta_local, cfg, st.session_state.user)
+        # NEW: recompute completed count from logs and jump to that index (sequential, no-skip)
+        comp_now = count_completed_pairs_seq(cfg, st.session_state.user)
+        next_idx = min(comp_now, max(0, len(meta)-1))
         st.session_state.idx = next_idx
-        save_progress_hint(st.session_state.cat, st.session_state.user, next_idx)
 
-        # Prefetch previews for the next index (and one ahead) to keep navigation instant
+        # Prefetch previews for new current and one ahead
         try:
-            j = st.session_state.idx
-            if 0 <= j < len(meta_local):
-                cur_next = meta_local[j]
+            if 0 <= next_idx < len(meta):
+                cur_next = meta[next_idx]
                 n_h = find_file_id_in_folder(drive, cfg["src_hypo"], cur_next.get("hypo_id",""))
                 n_a = find_file_id_in_folder(drive, cfg["src_adv"],  cur_next.get("adversarial_id",""))
                 if n_h: _ = preview_bytes(n_h, max_side=680)
                 if n_a: _ = preview_bytes(n_a, max_side=680)
-                if j+1 < len(meta_local):
-                    nxt2 = meta_local[j+1]
+                if next_idx+1 < len(meta):
+                    nxt2 = meta[next_idx+1]
                     n2_h = find_file_id_in_folder(drive, cfg["src_hypo"], nxt2.get("hypo_id",""))
                     n2_a = find_file_id_in_folder(drive, cfg["src_adv"],  nxt2.get("adversarial_id",""))
                     if n2_h: _ = preview_bytes(n2_h, max_side=680)
@@ -700,26 +627,7 @@ with left:
     navL, navC, navR = st.columns([1, 4, 1])
     with navL:
         if st.button("⏮ Prev", use_container_width=True):
-            st.session_state.idx = max(0, i-1)
-            save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
-            _flush_logs_if_needed(cfg, force=False)
-            # Prefetch current + next
-            try:
-                j = st.session_state.idx
-                if 0 <= j < len(meta):
-                    curp = meta[j]
-                    p_h = find_file_id_in_folder(drive, cfg["src_hypo"], curp.get("hypo_id",""))
-                    p_a = find_file_id_in_folder(drive, cfg["src_adv"],  curp.get("adversarial_id",""))
-                    if p_h: _ = preview_bytes(p_h, max_side=680)
-                    if p_a: _ = preview_bytes(p_a, max_side=680)
-                    if j+1 < len(meta):
-                        nxt = meta[j+1]
-                        n_h = find_file_id_in_folder(drive, cfg["src_hypo"], nxt.get("hypo_id",""))
-                        n_a = find_file_id_in_folder(drive, cfg["src_adv"],  nxt.get("adversarial_id",""))
-                        if n_h: _ = preview_bytes(n_h, max_side=680)
-                        if n_a: _ = preview_bytes(n_a, max_side=680)
-            except Exception:
-                pass
+            st.session_state.idx = max(0, st.session_state.idx - 1)
             st.rerun()
 
     cur = st.session_state.dec.get(pk, {})
@@ -732,31 +640,17 @@ with left:
 
     with navR:
         if st.button("Next ⏭", use_container_width=True):
-            st.session_state.idx = min(len(meta)-1, i+1)
-            save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
-            _flush_logs_if_needed(cfg, force=False)
-            try:
-                j = st.session_state.idx
-                if 0 <= j < len(meta):
-                    curp = meta[j]
-                    p_h = find_file_id_in_folder(drive, cfg["src_hypo"], curp.get("hypo_id",""))
-                    p_a = find_file_id_in_folder(drive, cfg["src_adv"],  curp.get("adversarial_id",""))
-                    if p_h: _ = preview_bytes(p_h, max_side=680)
-                    if p_a: _ = preview_bytes(p_a, max_side=680)
-                    if j+1 < len(meta):
-                        nxt = meta[j+1]
-                        n_h = find_file_id_in_folder(drive, cfg["src_hypo"], nxt.get("hypo_id",""))
-                        n_a = find_file_id_in_folder(drive, cfg["src_adv"],  nxt.get("adversarial_id",""))
-                        if n_h: _ = preview_bytes(n_h, max_side=680)
-                        if n_a: _ = preview_bytes(n_a, max_side=680)
-            except Exception:
-                pass
+            st.session_state.idx = min(len(meta)-1, st.session_state.idx + 1)
             st.rerun()
 
     # ---- Flash area directly UNDER Prev | Save | Next ----
     flash = st.session_state.get("last_save_flash")
     if flash:
         (st.success if flash.get("ok") else st.error)(flash["msg"])
+
+
+
+
 # # app.py — single-page, retry-hardened, overwrite-safe, compact UI
 # import io, json, time, hashlib, ssl
 # from typing import Dict, Any, Optional, List, Tuple
