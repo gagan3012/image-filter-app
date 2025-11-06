@@ -165,6 +165,20 @@ def create_shortcut_to_file(drive, src_file_id: str, new_name: str, dest_folder_
                                supportsAllDrives=True).execute()
     return res["id"]
 
+# ---- Click throttle (per-action, per-pair) ----
+def _cooldown_key(action_key: str) -> str:
+    return f"_next_ok_{action_key}"
+
+def cooldown_disabled(action_key: str) -> bool:
+    """Return True if still cooling down for this action."""
+    import time
+    return time.time() < st.session_state.get(_cooldown_key(action_key), 0.0)
+
+def cooldown_start(action_key: str, seconds: float = 0.8):
+    """Start/extend cooldown window."""
+    import time
+    st.session_state[_cooldown_key(action_key)] = time.time() + seconds
+
 # ================== Thumbnails / Full-res ===================
 @st.cache_data(show_spinner=False, max_entries=512, ttl=3600)
 def drive_thumbnail_bytes(file_id: str) -> Optional[bytes]:
@@ -456,11 +470,15 @@ with left:
         show_image(src_h_id, hypo_name, high_quality=st.session_state.hq)
         b1, b2 = st.columns(2)
         with b1:
-            if st.button("✅ Accept (hypo)", key=f"acc_h_{pk}"):
-                st.session_state.dec[pk]["hypo"] = "accepted"
+          acc_key = f"acc_h_{pk}"
+          if st.button("✅ Accept (hypo)", key=acc_key, disabled=cooldown_disabled(acc_key)):
+            cooldown_start(acc_key)  # 0.8s default
+            st.session_state.dec[pk]["hypo"] = "accepted"
         with b2:
-            if st.button("❌ Reject (hypo)", key=f"rej_h_{pk}"):
-                st.session_state.dec[pk]["hypo"] = "rejected"
+          rej_key = f"rej_h_{pk}"
+          if st.button("❌ Reject (hypo)", key=rej_key, disabled=cooldown_disabled(rej_key)):
+            cooldown_start(rej_key)
+            st.session_state.dec[pk]["hypo"] = "rejected"
         cur_h = st.session_state.dec[pk]["hypo"]
         st.markdown(f'<div class="caption">Current: <b>{cur_h if cur_h else "—"}</b> | '
                     f'Saved: <b>{saved_h or "—"}</b></div>', unsafe_allow_html=True)
@@ -470,11 +488,15 @@ with left:
         show_image(src_a_id, adv_name, high_quality=st.session_state.hq)
         b3, b4 = st.columns(2)
         with b3:
-            if st.button("✅ Accept (adv)", key=f"acc_a_{pk}"):
-                st.session_state.dec[pk]["adv"] = "accepted"
+          acca_key = f"acc_a_{pk}"
+          if st.button("✅ Accept (adv)", key=acca_key, disabled=cooldown_disabled(acca_key)):
+            cooldown_start(acca_key)
+            st.session_state.dec[pk]["adv"] = "accepted"
         with b4:
-            if st.button("❌ Reject (adv)", key=f"rej_a_{pk}"):
-                st.session_state.dec[pk]["adv"] = "rejected"
+          reja_key = f"rej_a_{pk}"
+          if st.button("❌ Reject (adv)", key=reja_key, disabled=cooldown_disabled(reja_key)):
+            cooldown_start(reja_key)
+            st.session_state.dec[pk]["adv"] = "rejected"
         cur_a = st.session_state.dec[pk]["adv"]
         st.markdown(f'<div class="caption">Current: <b>{cur_a if cur_a else "—"}</b> | '
                     f'Saved: <b>{saved_a or "—"}</b></div>', unsafe_allow_html=True)
@@ -574,24 +596,31 @@ with left:
     # ========== NAV row — Prev | BIG RED Save | Next ==========
     navL, navC, navR = st.columns([1, 4, 1])
     with navL:
-        if st.button("⏮ Prev"):
-            st.session_state.idx = max(0, i-1)
-            save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
-            st.rerun()
+      prev_key = f"prev_{pk}"
+      if st.button("⏮ Prev", key=prev_key, disabled=cooldown_disabled(prev_key)):
+          cooldown_start(prev_key)
+          st.session_state.idx = max(0, i-1)
+          save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
+          st.rerun()
 
     cur = st.session_state.dec.get(pk, {})
     can_save = (cur.get("hypo") in {"accepted", "rejected"}) and (cur.get("adv") in {"accepted", "rejected"})
 
     with navC:
-        st.button("💾 Save", key="save_btn", type="primary",
-                  disabled=(st.session_state.saving or not can_save),
-                  on_click=save_now, use_container_width=True)
+      save_key = f"save_{pk}"
+      can_save = (cur.get("hypo") in {"accepted", "rejected"}) and (cur.get("adv") in {"accepted", "rejected"})
+      disabled_save = (st.session_state.saving or not can_save or cooldown_disabled(save_key))
+      if st.button("💾 Save", key="save_btn", type="primary", disabled=disabled_save, use_container_width=True):
+          cooldown_start(save_key)
+          save_now()
 
     with navR:
-        if st.button("Next ⏭"):
-            st.session_state.idx = min(len(meta)-1, i+1)
-            save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
-            st.rerun()
+      next_key = f"next_{pk}"
+      if st.button("Next ⏭", key=next_key, disabled=cooldown_disabled(next_key)):
+          cooldown_start(next_key)
+          st.session_state.idx = min(len(meta)-1, i+1)
+          save_progress_hint(st.session_state.cat, st.session_state.user, st.session_state.idx)
+          st.rerun()
 
     # ---- Flash area directly UNDER Prev | Save | Next ----
     flash = st.session_state.get("last_save_flash")
