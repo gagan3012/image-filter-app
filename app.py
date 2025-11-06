@@ -10,8 +10,9 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload, MediaIoBaseUpload
 
-# ---- General tweaks ----
-Image.MAX_IMAGE_PIXELS = None
+# -------- Safe image defaults --------
+Image.MAX_IMAGE_PIXELS = 80_000_000  # keep huge images safe but not infinite
+
 st.set_page_config(page_title="Image Triplet Filter", layout="wide")
 
 # =========================== Auth ============================
@@ -45,7 +46,6 @@ if "user" not in st.session_state:
 def get_drive():
     sa_raw = st.secrets["gcp"]["service_account"]
     if isinstance(sa_raw, str):
-        # tolerate pasted JSON with real newlines
         if '"private_key"' in sa_raw and "\n" in sa_raw and "\\n" not in sa_raw:
             sa_raw = sa_raw.replace("\r\n", "\\n").replace("\n", "\\n")
         sa = json.loads(sa_raw)
@@ -56,7 +56,7 @@ def get_drive():
     )
     return build("drive", "v3", credentials=creds)
 
-def read_text_from_drive(drive, file_id: str) -> str:
+def _download_bytes(drive, file_id: str) -> bytes:
     req = drive.files().get_media(fileId=file_id, supportsAllDrives=True)
     buf = io.BytesIO()
     dl = MediaIoBaseDownload(buf, req)
@@ -64,12 +64,13 @@ def read_text_from_drive(drive, file_id: str) -> str:
     while not done:
         _, done = dl.next_chunk()
     buf.seek(0)
-    return buf.read().decode("utf-8", errors="ignore")
+    return buf.read()
+
+def read_text_from_drive(drive, file_id: str) -> str:
+    return _download_bytes(drive, file_id).decode("utf-8", errors="ignore")
 
 def append_lines_to_drive_text(drive, file_id: str, new_lines: list[str], retries: int = 3):
-    """
-    Optimistic append with tiny backoff (helps when 2 people save near-simultaneously).
-    """
+    # optimistic append with small retry for concurrent writers
     for attempt in range(retries):
         try:
             prev = read_text_from_drive(drive, file_id)
@@ -78,8 +79,8 @@ def append_lines_to_drive_text(drive, file_id: str, new_lines: list[str], retrie
             drive.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
             return
         except HttpError:
-            time.sleep(0.35 * (attempt + 1))
-    # last try: write just the new chunk (better than losing the action)
+            time.sleep(0.4 * (attempt + 1))
+    # last attempt without merge (still better than losing data)
     media = MediaIoBaseUpload(io.BytesIO("".join(new_lines).encode("utf-8")), mimetype="text/plain", resumable=False)
     drive.files().update(fileId=file_id, media_body=media, supportsAllDrives=True).execute()
 
@@ -102,14 +103,12 @@ def create_shortcut_to_file(drive, src_file_id: str, new_name: str, dest_folder_
         "parents": [dest_folder_id],
         "shortcutDetails": {"targetId": src_file_id},
     }
-    res = drive.files().create(
-        body=meta, fields="id,name", supportsAllDrives=True
-    ).execute()
+    res = drive.files().create(body=meta, fields="id,name", supportsAllDrives=True).execute()
     return res["id"]
 
-# ---- Cached previews (fast & memory-safe) ----
-@st.cache_data(show_spinner=False, max_entries=256, ttl=3600)
-def get_drive_thumbnail_bytes(file_id: str) -> Optional[bytes]:
+# ================== Thumbnails + Full-res (toggle) ===================
+@st.cache_data(show_spinner=False, max_entries=512, ttl=3600)
+def drive_thumbnail_bytes(file_id: str) -> Optional[bytes]:
     drv = get_drive()
     try:
         meta = drv.files().get(
@@ -120,7 +119,7 @@ def get_drive_thumbnail_bytes(file_id: str) -> Optional[bytes]:
         url = meta.get("thumbnailLink")
         if not url:
             return None
-        r = requests.get(url, timeout=10, headers={"User-Agent":"Mozilla/5.0"})
+        r = requests.get(url, timeout=10)
         if r.ok:
             return r.content
     except Exception:
@@ -128,35 +127,32 @@ def get_drive_thumbnail_bytes(file_id: str) -> Optional[bytes]:
     return None
 
 @st.cache_data(show_spinner=False, max_entries=256, ttl=3600)
-def make_preview_bytes(file_id: str, max_side: int = 720) -> bytes:
-    tb = get_drive_thumbnail_bytes(file_id)
+def preview_bytes(file_id: str, max_side: int = 900) -> bytes:
+    tb = drive_thumbnail_bytes(file_id)
     src = tb
     if src is None:
-        # fallback to original content (still cached)
-        drv = get_drive()
-        buf = io.BytesIO()
-        req = drv.files().get_media(fileId=file_id, supportsAllDrives=True)
-        dl = MediaIoBaseDownload(buf, req)
-        done = False
-        while not done:
-            _, done = dl.next_chunk()
-        buf.seek(0)
-        src = buf.read()
+        src = _download_bytes(get_drive(), file_id)
     with Image.open(io.BytesIO(src)) as im:
         im = im.convert("RGB")
         im.thumbnail((max_side, max_side))
         out = io.BytesIO()
-        im.save(out, format="JPEG", quality=85, optimize=True)
+        im.save(out, format="JPEG", quality=90, optimize=True)
         return out.getvalue()
 
-def show_img_preview(file_id: Optional[str], caption: str):
+@st.cache_data(show_spinner=False, max_entries=128, ttl=1800)
+def original_bytes(file_id: str) -> bytes:
+    # full-quality; cached briefly
+    return _download_bytes(get_drive(), file_id)
+
+def show_image(file_id: Optional[str], caption: str, high_quality: bool):
     if not file_id:
         st.error(f"Missing image: {caption}")
         return
     try:
-        st.image(make_preview_bytes(file_id), caption=caption, use_container_width=True)
+        data = original_bytes(file_id) if high_quality else preview_bytes(file_id)
+        st.image(data, caption=caption, use_container_width=True)
     except Exception as e:
-        st.error(f"Preview failed for {caption}: {e}")
+        st.error(f"Failed to render {caption}: {e}")
 
 # =========================== Category config ===========================
 CAT = {
@@ -164,7 +160,7 @@ CAT = {
         "jsonl_id": st.secrets["gcp"]["demography_jsonl_id"],
         "src_hypo": st.secrets["gcp"]["demography_hypo_folder"],
         "src_adv":  st.secrets["gcp"]["demography_adv_folder"],
-        "dst_hypo": st.secrets["gcp"]["demography_hypo_filtered"],   # accepted→shortcut
+        "dst_hypo": st.secrets["gcp"]["demography_hypo_filtered"],   # accepted → shortcut
         "dst_adv":  st.secrets["gcp"]["demography_adv_filtered"],
         "log_hypo": st.secrets["gcp"]["demography_hypo_filtered_log_id"],
         "log_adv":  st.secrets["gcp"]["demography_adv_filtered_log_id"],
@@ -197,7 +193,7 @@ CAT = {
 
 drive = get_drive()
 
-# ===================== Cached loaders (+dedupe) ======================
+# ===================== Readers / maps / progress ======================
 @st.cache_data(show_spinner=False)
 def load_meta(jsonl_id: str):
     # validate & read
@@ -218,10 +214,6 @@ def load_meta(jsonl_id: str):
     return out
 
 def _latest_by_pair_annotator(lines: list[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """
-    Keep the latest row per (pair_key, annotator). If annotator missing,
-    treat as 'unknown' to avoid collisions.
-    """
     m: Dict[str, Dict[str, Any]] = {}
     for rec in lines:
         hypo = rec.get("hypo_id") or ""
@@ -236,14 +228,53 @@ def _latest_by_pair_annotator(lines: list[Dict[str, Any]]) -> Dict[str, Dict[str
 
 @st.cache_data(show_spinner=False)
 def load_map(file_id: str):
-    rows = load_meta(file_id)  # read that JSONL (log) file
+    rows = load_meta(file_id)  # reuse reader
     return _latest_by_pair_annotator(rows)
 
-# ========================= UI State =========================
+# --- progress pointer per user & category (saved on Drive) ---
+def progress_file_id_for(cat: str, who: str) -> str:
+    # Create a deterministic name; you must create/locate this once under your logs folder
+    # Add this parent folder to secrets as: progress_parent_id
+    parent = st.secrets["gcp"].get("progress_parent_id")
+    if not parent:
+        # fallback: put beside hypo log file (works fine)
+        parent = st.secrets["gcp"][f"{cat}_hypo_filtered_log_id"]
+    fname = f"progress_{cat}_{who}.txt"
+
+    # Find or create
+    q = f"'{parent}' in parents and name = '{fname}' and trashed = false"
+    resp = drive.files().list(q=q, fields="files(id,name)", pageSize=1,
+                              supportsAllDrives=True, includeItemsFromAllDrives=True).execute()
+    files = resp.get("files", [])
+    if files:
+        return files[0]["id"]
+    # create empty
+    media = MediaIoBaseUpload(io.BytesIO(b"0"), mimetype="text/plain", resumable=False)
+    meta  = {"name": fname, "parents":[parent], "mimeType":"text/plain"}
+    return drive.files().create(body=meta, media_body=media, fields="id", supportsAllDrives=True).execute()["id"]
+
+def load_progress(cat: str, who: str) -> int:
+    try:
+        fid = progress_file_id_for(cat, who)
+        txt = read_text_from_drive(drive, fid).strip()
+        return max(0, int(txt or "0"))
+    except Exception:
+        return 0
+
+def save_progress(cat: str, who: str, idx: int):
+    try:
+        fid = progress_file_id_for(cat, who)
+        media = MediaIoBaseUpload(io.BytesIO(str(idx).encode()), mimetype="text/plain", resumable=False)
+        drive.files().update(fileId=fid, media_body=media, supportsAllDrives=True).execute()
+    except Exception:
+        pass  # non-fatal
+
+# ========================= UI state =========================
 if "page" not in st.session_state: st.session_state.page = "home"
 if "cat"  not in st.session_state: st.session_state.cat  = None
 if "idx"  not in st.session_state: st.session_state.idx  = 0
 if "dec"  not in st.session_state: st.session_state.dec  = {}   # pair_key -> {"hypo":..., "adv":...}
+if "hq"   not in st.session_state: st.session_state.hq   = False
 if "saving" not in st.session_state: st.session_state.saving = False
 if "last_save_token" not in st.session_state: st.session_state.last_save_token = None
 
@@ -257,7 +288,8 @@ if st.session_state.page == "home":
     cat_pick = st.selectbox("Select category", allowed)
     if st.button("Continue ➜", type="primary", key="home_go"):
         st.session_state.cat = cat_pick
-        st.session_state.idx = 0
+        # resume true index from Drive (not 0)
+        st.session_state.idx = load_progress(cat_pick, st.session_state.user)
         st.session_state.dec = {}
         st.session_state.saving = False
         go("dashboard")
@@ -268,8 +300,7 @@ elif st.session_state.page == "dashboard":
     cat = st.session_state.cat
     if cat is None:
         st.warning("Pick a category first.")
-        go("home")
-        st.stop()
+        go("home"); st.stop()
 
     who = st.session_state.user
     cfg  = CAT[cat]
@@ -279,11 +310,9 @@ elif st.session_state.page == "dashboard":
 
     def pair_key(e): return f"{e.get('hypo_id','')}|{e.get('adversarial_id','')}"
     total_pairs = len(meta)
-    completed = 0
-    for e in meta:
-        pk = pair_key(e)
-        if f"{pk}||{who}" in log_h and f"{pk}||{who}" in log_a:
-            completed += 1
+
+    # completed for THIS annotator only
+    completed = sum(1 for e in meta if (f"{pair_key(e)}||{who}" in log_h and f"{pair_key(e)}||{who}" in log_a))
     pending   = total_pairs - completed
 
     st.subheader(f"Category: **{cat}**")
@@ -292,23 +321,28 @@ elif st.session_state.page == "dashboard":
     c2.metric("Completed (you)", completed)
     c3.metric("Pending (you)", pending)
 
-    # first undecided for this annotator
+    # default resume index: last stored OR first undecided, whichever is further
+    stored_idx = load_progress(cat, who)
+
     def first_undecided_index():
         for i, e in enumerate(meta):
             pk = pair_key(e)
             if not (f"{pk}||{who}" in log_h and f"{pk}||{who}" in log_a):
                 return i
-        return 0
+        return len(meta) - 1 if meta else 0
+
+    start_idx = max(stored_idx, first_undecided_index())
 
     if st.button("▶️ Start / Resume", type="primary", key="dash_start"):
-        st.session_state.idx = first_undecided_index()
+        st.session_state.idx = start_idx
         st.session_state.saving = False
         go("review")
 
 # ========================== REVIEW ==========================
 elif st.session_state.page == "review":
-    top_l, _ = st.columns([1,6])
+    top_l, mid, top_r = st.columns([1,5,2])
     top_l.button("⬅️ Back", on_click=lambda: go("dashboard"), key="rev_back")
+    st.session_state.hq = top_r.toggle("High quality images", value=st.session_state.hq, help="Toggle original bytes (slower) vs cached previews (faster)")
 
     who = st.session_state.user
     cat = st.session_state.cat
@@ -317,16 +351,6 @@ elif st.session_state.page == "review":
     if not meta:
         st.warning("No records.")
         st.stop()
-
-    # helper to jump to next undecided pair for this annotator
-    def next_undecided_from(start_idx: int) -> int:
-        for j in range(start_idx, len(meta)):
-            hypo = meta[j].get("hypo_id","")
-            adv  = meta[j].get("adversarial_id","")
-            pk   = f"{hypo}|{adv}"
-            if not (f"{pk}||{who}" in load_map(cfg["log_hypo"]) and f"{pk}||{who}" in load_map(cfg["log_adv"])):
-                return j
-        return len(meta) - 1
 
     i = max(0, min(st.session_state.idx, len(meta)-1))
     entry = meta[i]
@@ -359,7 +383,7 @@ elif st.session_state.page == "review":
     # ---------- Hypothesis ----------
     with c1:
         st.markdown("**Hypothesis (non-proto)**")
-        show_img_preview(src_h_id, hypo_name)
+        show_image(src_h_id, hypo_name, high_quality=st.session_state.hq)
         b1, b2 = st.columns(2)
         with b1:
             if st.button("✅ Accept (hypo)", key=f"acc_h_{pk}", use_container_width=True):
@@ -372,7 +396,7 @@ elif st.session_state.page == "review":
     # ---------- Adversarial ----------
     with c2:
         st.markdown("**Adversarial (proto)**")
-        show_img_preview(src_a_id, adv_name)
+        show_image(src_a_id, adv_name, high_quality=st.session_state.hq)
         b3, b4 = st.columns(2)
         with b3:
             if st.button("✅ Accept (adv)", key=f"acc_a_{pk}", use_container_width=True):
@@ -397,7 +421,7 @@ elif st.session_state.page == "review":
         rec_h = dict(base); rec_h.update({"side":"hypothesis", "status": dec.get("hypo") or "rejected", "decided_at": ts})
         rec_a = dict(base); rec_a.update({"side":"adversarial", "status": dec.get("adv") or "rejected", "decided_at": ts})
 
-        # idempotence guard across quick re-clicks
+        # idempotence guard (per session)
         token = hashlib.sha1(json.dumps({"pk":pk, "h":rec_h["status"], "a":rec_a["status"], "who":who}).encode()).hexdigest()
         if st.session_state.last_save_token == token:
             st.info("Already saved this exact decision.")
@@ -405,7 +429,6 @@ elif st.session_state.page == "review":
             return
 
         try:
-            # Only create shortcuts when accepted (quota-safe)
             if dec.get("hypo") == "accepted" and src_h_id:
                 rec_h["copied_id"] = create_shortcut_to_file(drive, src_h_id, hypo_name, cfg["dst_hypo"])
             if dec.get("adv") == "accepted" and src_a_id:
@@ -423,16 +446,22 @@ elif st.session_state.page == "review":
             st.session_state.saving = False
             return
 
-        load_map.clear()  # refresh caches next draw
+        load_map.clear()
         st.session_state.last_save_token = token
         st.success("Saved.")
         st.session_state.saving = False
 
-    nav_l, save_c, nav_r, jump_r = st.columns([1,2,1,1])
+        # persist progress (index & resume)
+        next_idx = min(len(meta)-1, st.session_state.idx + 1)
+        save_progress(cat, who, next_idx)
+        st.session_state.idx = next_idx
+        st.rerun()
 
+    nav_l, save_c, nav_r = st.columns([1,2,1])
     with nav_l:
         if st.button("⏮ Prev", key=f"prev_{pk}", use_container_width=True):
             st.session_state.idx = max(0, i-1)
+            save_progress(cat, st.session_state.user, st.session_state.idx)
             st.rerun()
 
     with save_c:
@@ -442,9 +471,5 @@ elif st.session_state.page == "review":
     with nav_r:
         if st.button("Next ⏭", key=f"next_{pk}", use_container_width=True):
             st.session_state.idx = min(len(meta)-1, i+1)
-            st.rerun()
-
-    with jump_r:
-        if st.button("Next undecided ➡️", key=f"next_und_{pk}", use_container_width=True):
-            st.session_state.idx = next_undecided_from(i+1)
+            save_progress(cat, st.session_state.user, st.session_state.idx)
             st.rerun()
