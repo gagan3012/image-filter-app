@@ -74,7 +74,7 @@ class DriveToLabelStudio:
                 except json.JSONDecodeError as e:
                     print(f"Warning: Skipping invalid JSON line: {e}")
                     continue
-        return records[:3]
+        return records
 
     def find_file_id(self, folder_id: str, filename: str) -> str:
         """Find file ID by name in folder."""

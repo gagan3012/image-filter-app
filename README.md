@@ -4,9 +4,11 @@ Automated image filtering pipeline using MLLMs (Qwen-VL) with Label Studio for h
 
 ## 🚀 Quick Start
 
-### 1. Run MLLM Filter
+### Option A: With MLLM Pre-filtering (Recommended)
 
-Filter image pairs using the vision-language model:
+#### 1. Run MLLM Filter
+
+Filter image pairs using the vision-language model to get only high-quality pairs:
 
 ```bash
 python qwen3_filter.py \
@@ -20,7 +22,21 @@ python qwen3_filter.py \
 **Output**:
 
 - `detailed_results_{start}_{end}.jsonl` - All evaluations
-- `label_studio_accepted_{start}_{end}.json` - Both-accepted pairs only
+- `label_studio_accepted_{start}_{end}.json` - Both-accepted pairs only ✨
+
+### Option B: Without MLLM Pre-filtering
+
+#### 1. Run Direct Data Preparation
+
+Prepare all pairs without MLLM filtering:
+
+```bash
+python data_prep.py
+```
+
+**Output**:
+
+- `tasks_{category}.json` - All image pairs for each category
 
 ### 2. Setup Label Studio Interface
 
@@ -39,5 +55,7 @@ Visit: <https://huggingface.co/spaces/gagan3012/image-filter>
 2. Go to **Settings** → **Labeling Interface**
 3. Paste the XML from step 2
 4. Go to **Import** tab
-5. Upload `label_studio_accepted_{category}_{start}_{end}.json` files
+5. Upload your JSON file:
+   - `label_studio_accepted_*.json` (MLLM filtered) OR
+   - `tasks_*.json` (all pairs)
 6. Start annotating! 🎯
