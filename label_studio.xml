@@ -1,0 +1,46 @@
+<View>
+  <Header value="Image Triplet Annotation"/>
+  
+  <View style="display: flex; justify-content: space-between;">
+    <View style="flex: 1; margin: 10px;">
+      <Header value="Text Prompt"/>
+      <Text name="text" value="$text"/>
+      
+      <Header value="Hypothesis (Non-Prototype)"/>
+      <Collapse>
+        <Panel value="Show/Hide">
+          <Text name="hypothesis" value="$hypothesis"/>
+        </Panel>
+      </Collapse>
+    </View>
+    
+    <View style="flex: 1; margin: 10px;">
+      <Header value="Adversarial (Prototype)"/>
+      <Collapse>
+        <Panel value="Show/Hide">
+          <Text name="adversarial" value="$adversarial"/>
+        </Panel>
+      </Collapse>
+    </View>
+  </View>
+  
+  <View style="display: flex; justify-content: space-around; margin-top: 20px;">
+    <View style="flex: 1; margin: 10px; border: 1px solid #ccc; padding: 10px;">
+      <Header value="Hypothesis Image"/>
+      <Image name="hypo_image" value="$hypo_image_url" zoom="true" rotateControl="true"/>
+      <Choices name="hypo_decision" toName="hypo_image" choice="single-radio" required="true">
+        <Choice value="accepted" style="background-color: #90EE90;"/>
+        <Choice value="rejected" style="background-color: #FFB6C6;"/>
+      </Choices>
+    </View>
+    
+    <View style="flex: 1; margin: 10px; border: 1px solid #ccc; padding: 10px;">
+      <Header value="Adversarial Image"/>
+      <Image name="adv_image" value="$adv_image_url" zoom="true" rotateControl="true"/>
+      <Choices name="adv_decision" toName="adv_image" choice="single-radio" required="true">
+        <Choice value="accepted" style="background-color: #90EE90;"/>
+        <Choice value="rejected" style="background-color: #FFB6C6;"/>
+      </Choices>
+    </View>
+  </View>
+</View>
